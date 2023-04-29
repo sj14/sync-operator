@@ -4,10 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-
 	syncv1alpha1 "github.com/sj14/sync-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -61,41 +60,13 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	logger.Info("original", "original", original)
 
-	if len(syncObject.Spec.TargetNamespaces) > 0 {
+	targetNamespaces, err := r.getTargetNamespaces(ctx, syncObject)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed getting target namespaces: %v", err)
+	}
 
-	} else {
-		var namespaces corev1.NamespaceList
-
-		if err := r.Client.List(ctx, &namespaces); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed listing namespaces: %v", err)
-		}
-
-		for _, namespace := range namespaces.Items {
-			replica := original.DeepCopy()
-			replica.SetNamespace(namespace.GetName())
-
-			// remove state from the old object
-			replica.SetResourceVersion("")
-			replica.SetUID(types.UID(""))
-			// TODO: add more?
-
-			// create new replica if it doesn't already exist
-			var err error
-			if err = r.Client.Create(ctx, replica); client.IgnoreAlreadyExists(err) != nil {
-				logger.Error(err, "failed creating replica", "namespace", namespace.GetName())
-				continue
-			}
-
-			if !apierrors.IsAlreadyExists(err) {
-				// we create a new replica, no need for updating it
-				continue
-			}
-
-			// replica already exists, just update it
-			if err := r.Client.Update(ctx, replica); err != nil {
-				logger.Error(err, "failed updating replica", "namespace", namespace.GetName())
-			}
-		}
+	for _, namespace := range targetNamespaces {
+		r.replicate(ctx, original, namespace)
 	}
 
 	return ctrl.Result{}, nil
@@ -106,4 +77,73 @@ func (r *SyncObjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&syncv1alpha1.SyncObject{}).
 		Complete(r)
+}
+
+// TODO: add unit test
+func (r *SyncObjectReconciler) getTargetNamespaces(ctx context.Context, syncObject syncv1alpha1.SyncObject) ([]string, error) {
+	targetNamespaces := syncObject.Spec.TargetNamespaces
+
+	// no namespaces defined, sync to all of them
+	if len(targetNamespaces) == 0 {
+		var namespaces corev1.NamespaceList
+
+		if err := r.Client.List(ctx, &namespaces); err != nil {
+			return nil, fmt.Errorf("failed listing namespaces: %v", err)
+		}
+
+		for _, namespace := range namespaces.Items {
+			if namespace.GetName() == syncObject.Spec.Reference.Namespace {
+				// don't create a replica in the reference namespace
+				continue
+			}
+			targetNamespaces = append(targetNamespaces, namespace.GetName())
+		}
+	}
+
+	// Remove namespaces we want to ignore
+	for _, ignoreNamespace := range syncObject.Spec.IgnoreNamespaces {
+		targetNamespaces = remove(targetNamespaces, ignoreNamespace)
+	}
+
+	return targetNamespaces, nil
+}
+
+func remove(slice []string, s string) []string {
+	var result []string
+	for idx := range slice {
+		if slice[idx] == s {
+			continue
+		}
+		result = append(slice[:idx], slice[idx+1:]...)
+	}
+	return result
+}
+
+// TODO: Add finalizer, ownerreference/managedby?
+func (r *SyncObjectReconciler) replicate(ctx context.Context, original unstructured.Unstructured, namespace string) error {
+	replica := original.DeepCopy()
+	replica.SetNamespace(namespace)
+
+	// remove state from the old object
+	replica.SetResourceVersion("")
+	replica.SetUID(types.UID(""))
+	// TODO: add more?
+
+	// create new replica if it doesn't already exist
+	var err error
+	if err = r.Client.Create(ctx, replica); client.IgnoreAlreadyExists(err) != nil {
+		return fmt.Errorf("failed creating replica in %q: %v", namespace, err)
+	}
+
+	if !apierrors.IsAlreadyExists(err) {
+		// we create a new replica, no need for updating it
+		return nil
+	}
+
+	// replica already exists, just update it
+	if err := r.Client.Update(ctx, replica); err != nil {
+		return fmt.Errorf("failed updating replica in %q: %v", namespace, err)
+	}
+
+	return nil
 }

@@ -12,9 +12,14 @@ import (
 type SyncObjectSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	Reference        Reference `json:"reference"`
-	TargetNamespaces []string  `json:"targetNamespaces,omitempty"`
-	// ref       corev1.TypedObjectReference
+
+	Reference Reference `json:"reference"`
+	// If no target namespaces are defined, all namespaces will be used.
+	TargetNamespaces []string `json:"targetNamespaces,omitempty"`
+	// Explicitly skip replication to the specified namespaces.
+	IgnoreNamespaces []string `json:"ignoreNamespaces,omitempty"`
+	// Don't add a finalizer which would clean up the replicas when this SyncObject gets deleted.
+	DisableFinalizer bool `json:"disableFinalizer,omitempty"`
 }
 
 type Reference struct {

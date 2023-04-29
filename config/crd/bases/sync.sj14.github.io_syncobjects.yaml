@@ -35,9 +35,16 @@ spec:
           spec:
             description: SyncObjectSpec defines the desired state of SyncObject
             properties:
+              disableFinalizer:
+                description: Don't add a finalizer which would clean up the replicas
+                  when this SyncObject gets deleted.
+                type: boolean
+              ignoreNamespaces:
+                description: Explicitly skip replication to the specified namespaces.
+                items:
+                  type: string
+                type: array
               reference:
-                description: 'INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-                  Important: Run "make" to regenerate code after modifying this file'
                 properties:
                   group:
                     type: string
@@ -57,6 +64,8 @@ spec:
                 - version
                 type: object
               targetNamespaces:
+                description: If no target namespaces are defined, all namespaces will
+                  be used.
                 items:
                   type: string
                 type: array
