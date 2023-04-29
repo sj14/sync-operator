@@ -11,17 +11,16 @@ data:
 apiVersion: sync.sj14.github.io/v1alpha1
 kind: SyncObject
 metadata:
-  labels:
-    app.kubernetes.io/name: syncobject
-    app.kubernetes.io/instance: syncobject-sample
-    app.kubernetes.io/part-of: kubebuilder-test
-    app.kubernetes.io/managed-by: kustomize
-    app.kubernetes.io/created-by: kubebuilder-test
   name: syncobject-sample
 spec:
   reference:
     group: "" # empty for core group
     version: v1 
-    kind: ConfigMap
+    kind: ConfigMap # case-sensitive!
     name: test
     namespace: "default"
+  # targetNamespaces:
+  #   - kube-public
+  # ignoreNamespaces:
+  #   - kube-system
+  # disableFinalizer: true

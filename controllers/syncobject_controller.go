@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	syncv1alpha1 "github.com/sj14/sync-operator/api/v1alpha1"
+	"golang.org/x/exp/slices"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -60,37 +61,24 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
-	var original unstructured.Unstructured
-	original.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   syncObject.Spec.Reference.Group,
-		Version: syncObject.Spec.Reference.Version,
-		Kind:    syncObject.Spec.Reference.Kind,
-	})
-	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: syncObject.Spec.Reference.Namespace, Name: syncObject.Spec.Reference.Name}, &original); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed getting original object: %v", err)
-	}
-
-	logger.Info("original", "original", original)
-
-	targetNamespaces, err := r.getTargetNamespaces(ctx, syncObject)
+	targetNamespaces, nonTargetNamespaces, err := r.getTargetNamespaces(ctx, syncObject)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed getting target namespaces: %v", err)
 	}
 
-	for _, namespace := range targetNamespaces {
-		r.replicate(ctx, original, namespace)
+	// cleanup leftovers, e.g. when the targetNamespaces changed
+	for _, namespace := range nonTargetNamespaces {
+		r.deleteReplica(ctx, syncObject, namespace)
 	}
 
-	// TODO: check if there are replicaes which need to be removed, e.g. because a targetNamespace got removed or a ignoreNamespace got added.
+	for _, namespace := range targetNamespaces {
+		r.replicate(ctx, syncObject, namespace)
+	}
 
 	return ctrl.Result{}, nil
 }
 
 func (r *SyncObjectReconciler) handleFinalizer(ctx context.Context, syncObject *syncv1alpha1.SyncObject) (stop bool, err error) {
-	if syncObject.Spec.DisableFinalizer {
-		return false, nil
-	}
-
 	// examine DeletionTimestamp to determine if object is under deletion
 	if syncObject.ObjectMeta.DeletionTimestamp.IsZero() {
 		// The object is not being deleted, so if it does not have our finalizer,
@@ -107,11 +95,13 @@ func (r *SyncObjectReconciler) handleFinalizer(ctx context.Context, syncObject *
 
 	// The object is being deleted
 	if controllerutil.ContainsFinalizer(syncObject, finalizerName) {
-		// our finalizer is present, so lets handle any external dependency
-		if err := r.deleteAllReplicas(ctx, *syncObject); err != nil {
-			// if fail to delete the external dependency here, return with error
-			// so that it can be retried
-			return true, err
+		if !syncObject.Spec.DisableFinalizer {
+			// our finalizer is present, so lets handle any external dependency
+			if err := r.deleteAllReplicas(ctx, *syncObject); err != nil {
+				// if fail to delete the external dependency here, return with error
+				// so that it can be retried
+				return true, err
+			}
 		}
 
 		// remove our finalizer from the list and update it.
@@ -135,18 +125,20 @@ func (r *SyncObjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 // TODO: add unit test
-func (r *SyncObjectReconciler) getTargetNamespaces(ctx context.Context, syncObject syncv1alpha1.SyncObject) ([]string, error) {
+// returns target and non-target namespaces
+func (r *SyncObjectReconciler) getTargetNamespaces(ctx context.Context, syncObject syncv1alpha1.SyncObject) ([]string, []string, error) {
 	targetNamespaces := syncObject.Spec.TargetNamespaces
+	nonTargetNamespaces := syncObject.Spec.IgnoreNamespaces
+
+	var allNamespaces corev1.NamespaceList
+
+	if err := r.Client.List(ctx, &allNamespaces); err != nil {
+		return nil, nil, fmt.Errorf("failed listing namespaces: %v", err)
+	}
 
 	// no namespaces defined, sync to all of them
 	if len(targetNamespaces) == 0 {
-		var namespaces corev1.NamespaceList
-
-		if err := r.Client.List(ctx, &namespaces); err != nil {
-			return nil, fmt.Errorf("failed listing namespaces: %v", err)
-		}
-
-		for _, namespace := range namespaces.Items {
+		for _, namespace := range allNamespaces.Items {
 			if namespace.GetName() == syncObject.Spec.Reference.Namespace {
 				// don't create a replica in the reference namespace
 				continue
@@ -155,12 +147,27 @@ func (r *SyncObjectReconciler) getTargetNamespaces(ctx context.Context, syncObje
 		}
 	}
 
+	// we only sync to specified namespaces, check which are nonTarget namespaces
+	// so we can delete replicas there if there are some leftovers
+	if len(targetNamespaces) > 0 {
+		for _, namespace := range allNamespaces.Items {
+			if namespace.GetName() == syncObject.Spec.Reference.Namespace {
+				// don't remove reference
+				continue
+			}
+			if !slices.Contains(targetNamespaces, namespace.GetName()) {
+				// namespace is not a target
+				nonTargetNamespaces = append(nonTargetNamespaces, namespace.GetName())
+			}
+		}
+	}
+
 	// Remove namespaces we want to ignore
 	for _, ignoreNamespace := range syncObject.Spec.IgnoreNamespaces {
 		targetNamespaces = remove(targetNamespaces, ignoreNamespace)
 	}
 
-	return targetNamespaces, nil
+	return targetNamespaces, nonTargetNamespaces, nil
 }
 
 func remove(slice []string, s string) []string {
@@ -175,7 +182,18 @@ func remove(slice []string, s string) []string {
 }
 
 // TODO: Add finalizer, ownerreference/managedby?
-func (r *SyncObjectReconciler) replicate(ctx context.Context, original unstructured.Unstructured, namespace string) error {
+func (r *SyncObjectReconciler) replicate(ctx context.Context, syncObject syncv1alpha1.SyncObject, namespace string) error {
+	var original unstructured.Unstructured
+	original.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   syncObject.Spec.Reference.Group,
+		Version: syncObject.Spec.Reference.Version,
+		Kind:    syncObject.Spec.Reference.Kind,
+	})
+
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: syncObject.Spec.Reference.Namespace, Name: syncObject.Spec.Reference.Name}, &original); err != nil {
+		return fmt.Errorf("failed getting original object: %v", err)
+	}
+
 	replica := original.DeepCopy()
 	replica.SetNamespace(namespace)
 
