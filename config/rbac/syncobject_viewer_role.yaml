@@ -1,0 +1,27 @@
+# permissions for end users to view syncobjects.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: clusterrole
+    app.kubernetes.io/instance: syncobject-viewer-role
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/created-by: kubebuilder-test
+    app.kubernetes.io/part-of: kubebuilder-test
+    app.kubernetes.io/managed-by: kustomize
+  name: syncobject-viewer-role
+rules:
+- apiGroups:
+  - sync.sj14.github.io
+  resources:
+  - syncobjects
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - sync.sj14.github.io
+  resources:
+  - syncobjects/status
+  verbs:
+  - get

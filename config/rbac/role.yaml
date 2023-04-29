@@ -1,0 +1,33 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  creationTimestamp: null
+  name: manager-role
+rules:
+- apiGroups:
+  - sync.sj14.github.io
+  resources:
+  - syncobjects
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - sync.sj14.github.io
+  resources:
+  - syncobjects/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - sync.sj14.github.io
+  resources:
+  - syncobjects/status
+  verbs:
+  - get
+  - patch
+  - update

@@ -1,0 +1,31 @@
+# permissions for end users to edit syncobjects.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: clusterrole
+    app.kubernetes.io/instance: syncobject-editor-role
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/created-by: kubebuilder-test
+    app.kubernetes.io/part-of: kubebuilder-test
+    app.kubernetes.io/managed-by: kustomize
+  name: syncobject-editor-role
+rules:
+- apiGroups:
+  - sync.sj14.github.io
+  resources:
+  - syncobjects
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - sync.sj14.github.io
+  resources:
+  - syncobjects/status
+  verbs:
+  - get
