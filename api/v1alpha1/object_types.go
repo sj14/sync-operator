@@ -22,6 +22,7 @@ type ObjectStatus struct {
 }
 
 //+kubebuilder:object:root=true
+//+kubebuilder:resource:scope=Cluster
 //+kubebuilder:subresource:status
 
 // Object is the Schema for the objects API
