@@ -1,3 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test
+  namespace: default
+data:
+    key1: value1
+    key2: value2 
+    key3: value3
+---
 apiVersion: sync.sj14.github.io/v1alpha1
 kind: SyncObject
 metadata:
@@ -9,4 +19,9 @@ metadata:
     app.kubernetes.io/created-by: kubebuilder-test
   name: syncobject-sample
 spec:
-  # TODO(user): Add fields here
+  reference:
+    group: "" # empty for core group
+    version: v1 
+    kind: ConfigMap
+    name: test
+    namespace: "default"

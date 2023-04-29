@@ -1,7 +1,7 @@
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
+	// corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -12,7 +12,17 @@ import (
 type SyncObjectSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	Reference corev1.ObjectReference `json:"reference,omitempty"`
+	Reference        Reference `json:"reference"`
+	TargetNamespaces []string  `json:"targetNamespaces,omitempty"`
+	// ref       corev1.TypedObjectReference
+}
+
+type Reference struct {
+	Group     string `json:"group"`
+	Version   string `json:"version"`
+	Kind      string `json:"kind"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
 }
 
 // SyncObjectStatus defines the observed state of SyncObject
