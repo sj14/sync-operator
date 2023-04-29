@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -11,9 +12,7 @@ import (
 type SyncObjectSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-
-	// Foo is an example field of SyncObject. Edit syncobject_types.go to remove/update
-	Foo string `json:"foo,omitempty"`
+	Reference corev1.ObjectReference `json:"reference,omitempty"`
 }
 
 // SyncObjectStatus defines the observed state of SyncObject
