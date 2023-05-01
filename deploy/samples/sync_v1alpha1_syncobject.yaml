@@ -13,6 +13,7 @@ kind: SyncObject
 metadata:
   name: syncobject-sample
 spec:
+  # interval: 1h
   reference:
     group: "" # empty for core group
     version: v1 

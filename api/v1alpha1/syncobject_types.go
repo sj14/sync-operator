@@ -1,7 +1,6 @@
 package v1alpha1
 
 import (
-	// corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -20,6 +19,8 @@ type SyncObjectSpec struct {
 	IgnoreNamespaces []string `json:"ignoreNamespaces,omitempty"`
 	// Don't add a finalizer which would clean up the replicas when this SyncObject gets deleted.
 	DisableFinalizer bool `json:"disableFinalizer,omitempty"`
+	// Interval for syncing the reference resource. The default interval is 10 hours.
+	Interval metav1.Duration `json:"interval,omitempty"`
 }
 
 type Reference struct {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	syncv1alpha1 "github.com/sj14/sync-operator/api/v1alpha1"
 	"golang.org/x/exp/slices"
@@ -79,9 +78,8 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, multiErr
 	}
 
-	// when there was no error, requeue after 1 hour to keep changes in sync.
-	// TODO: find a better way to do this, or add an option to the SyncObject type whill will allow specifying the time
-	return ctrl.Result{RequeueAfter: 1 * time.Hour}, nil
+	// when there was no error, requeue after <interval> to keep changes in sync.
+	return ctrl.Result{RequeueAfter: syncObject.Spec.Interval.Duration}, nil
 }
 
 func (r *SyncObjectReconciler) handleFinalizer(ctx context.Context, syncObject *syncv1alpha1.SyncObject) (stop bool, err error) {
