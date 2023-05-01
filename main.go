@@ -17,7 +17,6 @@ import (
 
 	syncv1alpha1 "github.com/sj14/sync-operator/api/v1alpha1"
 	"github.com/sj14/sync-operator/controllers"
-	//+kubebuilder:scaffold:imports
 )
 
 var (
@@ -27,9 +26,7 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-
 	utilruntime.Must(syncv1alpha1.AddToScheme(scheme))
-	//+kubebuilder:scaffold:scheme
 }
 
 func main() {
@@ -80,7 +77,6 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "SyncObject")
 		os.Exit(1)
 	}
-	//+kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
