@@ -27,10 +27,6 @@ type SyncObjectReconciler struct {
 
 const finalizerName = "sync.sj14.github.io/finalizer"
 
-//+kubebuilder:rbac:groups=sync.sj14.github.io,resources=syncobjects,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=sync.sj14.github.io,resources=syncobjects/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=sync.sj14.github.io,resources=syncobjects/finalizers,verbs=update
-
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 //
@@ -66,16 +62,21 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("failed getting target namespaces: %v", err)
 	}
 
+	var multiErr error
 	// cleanup leftovers, e.g. when the targetNamespaces changed
 	for _, namespace := range nonTargetNamespaces {
-		r.deleteReplica(ctx, syncObject, namespace)
+		if err := r.deleteReplica(ctx, syncObject, namespace); err != nil {
+			multiErr = errors.Join(multiErr, fmt.Errorf("failed cleaning up replica: %v", err))
+		}
 	}
 
 	for _, namespace := range targetNamespaces {
-		r.replicate(ctx, syncObject, namespace)
+		if err := r.replicate(ctx, syncObject, namespace); err != nil {
+			multiErr = errors.Join(multiErr, fmt.Errorf("failed creating replica: %v", err))
+		}
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, multiErr
 }
 
 func (r *SyncObjectReconciler) handleFinalizer(ctx context.Context, syncObject *syncv1alpha1.SyncObject) (stop bool, err error) {
@@ -201,6 +202,10 @@ func (r *SyncObjectReconciler) replicate(ctx context.Context, syncObject syncv1a
 	replica.SetResourceVersion("")
 	replica.SetUID(types.UID(""))
 	// TODO: add more?
+
+	if err := ctrl.SetControllerReference(&syncObject, replica, r.Scheme); err != nil {
+		return fmt.Errorf("failed setting controller reference: %v", err)
+	}
 
 	// create new replica if it doesn't already exist
 	err := r.Client.Create(ctx, replica)

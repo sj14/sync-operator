@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: test
+  name: test-sync
   namespace: default
 data:
     key1: value1
@@ -17,8 +17,8 @@ spec:
     group: "" # empty for core group
     version: v1 
     kind: ConfigMap # case-sensitive!
-    name: test
-    namespace: "default"
+    name: test-sync
+    namespace: default
   # targetNamespaces:
   #   - kube-public
   # ignoreNamespaces:
