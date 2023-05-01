@@ -47,8 +47,6 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, fmt.Errorf("failed getting SyncObject: %v", err)
 	}
 
-	logger.Info("reference", "reference", syncObject.Spec.Reference)
-
 	stop, err := r.handleFinalizer(ctx, &syncObject)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed handling finalizer: %v", err)
@@ -203,18 +201,20 @@ func (r *SyncObjectReconciler) replicate(ctx context.Context, syncObject syncv1a
 	replica.SetUID(types.UID(""))
 	// TODO: add more?
 
+	// TODO: setting the reference doesn't do anything on it's own or it may be slow in trigering?
 	if err := ctrl.SetControllerReference(&syncObject, replica, r.Scheme); err != nil {
 		return fmt.Errorf("failed setting controller reference: %v", err)
 	}
 
 	// create new replica if it doesn't already exist
 	err := r.Client.Create(ctx, replica)
-	if !apierrors.IsAlreadyExists(err) {
-		// we create a new replica, no need for updating it
-		return nil
-	}
-	if err != nil {
+	if err != nil && !apierrors.IsAlreadyExists(err) {
+		// some other error than already exists...
 		return fmt.Errorf("failed creating replica in %q: %v", namespace, err)
+	}
+	if err == nil {
+		// we created a new replica, no need to update it now
+		return nil
 	}
 
 	// replica already exists, just update it
