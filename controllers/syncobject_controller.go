@@ -201,11 +201,6 @@ func (r *SyncObjectReconciler) replicate(ctx context.Context, syncObject syncv1a
 	replica.SetUID(types.UID(""))
 	// TODO: add more?
 
-	// TODO: setting the reference doesn't do anything on it's own or it may be slow in trigering?
-	if err := ctrl.SetControllerReference(&syncObject, replica, r.Scheme); err != nil {
-		return fmt.Errorf("failed setting controller reference: %v", err)
-	}
-
 	// create new replica if it doesn't already exist
 	err := r.Client.Create(ctx, replica)
 	if err != nil && !apierrors.IsAlreadyExists(err) {
