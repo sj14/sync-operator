@@ -206,6 +206,8 @@ func (r *SyncObjectReconciler) replicate(ctx context.Context, syncObject syncv1a
 	replica.SetUID(types.UID(""))
 	// TODO: add more?
 
+	log.Log.Info("creating/updating", "gvk", replica.GroupVersionKind().String(), "namespace", replica.GetNamespace(), "name", replica.GetName())
+
 	// create new replica if it doesn't already exist
 	err := r.Client.Create(ctx, replica)
 	if err != nil && !apierrors.IsAlreadyExists(err) {
@@ -236,7 +238,7 @@ func (r *SyncObjectReconciler) deleteReplica(ctx context.Context, syncObject syn
 		Kind:    syncObject.Spec.Reference.Kind,
 	})
 
-	log.Log.Info("going to delete", "object", objectToDelete, "ns", namespace)
+	log.Log.Info("deleting", "object", objectToDelete)
 
 	if err := r.Client.Delete(ctx, &objectToDelete); err != nil {
 		return fmt.Errorf("failed deleting replica: %v", err)
