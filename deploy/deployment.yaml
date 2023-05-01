@@ -70,7 +70,7 @@ spec:
             - --leader-elect
           command:
             - /manager
-          image: docker.io/library/controller
+          image: ghcr.io/sj14/sync-operator:latest # TODO: pin version
           imagePullPolicy: IfNotPresent
           livenessProbe:
             httpGet:
