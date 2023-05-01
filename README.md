@@ -18,3 +18,41 @@ Apply the manifests:
 ```console
 kubectl apply -Rf deploy/
 ```
+
+## Example
+
+Lets imagine we have the following `ConfigMap` we want to sync:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-sync
+  namespace: default
+data:
+    key1: value1
+```
+
+When you have installed the CRDs and the Operator succesfully, you can create a `SyncObject` and reference the `ConfigMap` from above:
+
+```yaml
+apiVersion: sync.sj14.github.io/v1alpha1
+kind: SyncObject
+metadata:
+  name: syncobject-sample
+spec:
+  # interval: 1h            # How often to sync the reference resource (defaults to 10h)
+  # targetNamespaces:       # Namespaces to replicate the reference into (defaults to all namespaces)
+  #   - kube-public
+  # ignoreNamespaces:       # Namespaces to not replicate into
+  #   - kube-system
+  # disableFinalizer: true  # Do not remove replicas when the reference gets removed
+  reference:                # Reference which will get replicated into other namespaces
+    group: ""               # empty for core group
+    version: v1 
+    kind: ConfigMap         # case-sensitive!
+    name: test-sync
+    namespace: default
+```
+
+After applying the manifests, the `ConfigMap` should get synced across the namespaces.
