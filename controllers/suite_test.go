@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -26,8 +27,24 @@ var (
 )
 
 func TestMain(m *testing.M) {
-	logf.SetLogger(zap.New(zap.WriteTo(os.Stdout), zap.UseDevMode(true)))
+	// setup
 	ctx, cancel := context.WithCancel(context.TODO())
+	testEnv, err := setup(ctx)
+	if err != nil {
+		shutdown(cancel, testEnv)
+		log.Fatalf("failed test setup: %v", err)
+	}
+
+	// run tests
+	code := m.Run()
+
+	// cleanup
+	shutdown(cancel, testEnv)
+	os.Exit(code)
+}
+
+func setup(ctx context.Context) (*envtest.Environment, error) {
+	logf.SetLogger(zap.New(zap.WriteTo(os.Stdout), zap.UseDevMode(true)))
 
 	testEnv := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "deploy", "crds")},
@@ -36,37 +53,23 @@ func TestMain(m *testing.M) {
 
 	cfg, err := testEnv.Start()
 	if err != nil {
-		log.Panicf("failed starting the test environment: %s\n", err)
+		return testEnv, fmt.Errorf("failed starting the test environment: %s", err)
 	}
-	if cfg == nil {
-		log.Panicln("testenv config is nil")
-	}
-	defer func() {
-		log.Println("tearing down the test environment")
-		cancel()
-		if err := testEnv.Stop(); err != nil {
-			log.Printf("failed stopping test environment: %s\n", err)
-		}
-	}()
-
-	err = syncv1alpha1.AddToScheme(scheme.Scheme)
-	if err != nil {
-		log.Panicf("failed adding scheme: %s\n", err)
+	if err := syncv1alpha1.AddToScheme(scheme.Scheme); err != nil {
+		return testEnv, fmt.Errorf("failed adding scheme: %s", err)
 	}
 
+	// setup global k8sClient used in tests
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	if err != nil {
-		log.Panicf("failed creating new controller client: %s\n", err)
-	}
-	if k8sClient == nil {
-		log.Panicln("k8sClient is nil")
+		return testEnv, fmt.Errorf("failed creating new controller client: %s", err)
 	}
 
 	k8sManager, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme.Scheme,
 	})
 	if err != nil {
-		log.Panicf("failed creating new manager: %s\n", err)
+		return testEnv, fmt.Errorf("failed creating new manager: %s", err)
 	}
 
 	err = (&SyncObjectReconciler{
@@ -74,17 +77,28 @@ func TestMain(m *testing.M) {
 		Scheme: k8sManager.GetScheme(),
 	}).SetupWithManager(k8sManager)
 	if err != nil {
-		log.Panicf("SyncObjectReconciler setup failed: %s\n", err)
+		return testEnv, fmt.Errorf("SyncObjectReconciler setup failed: %s", err)
 	}
 
 	go func() {
 		err = k8sManager.Start(ctx)
 		if err != nil {
-			log.Panicf("failed starting k8s manager: %s\n", err)
+			log.Fatalf("failed starting k8s manager: %s\n", err)
 		}
 	}()
 
-	os.Exit(m.Run())
+	return testEnv, nil
+}
+
+func shutdown(cancel context.CancelFunc, testEnv *envtest.Environment) {
+	log.Println("tearing down the test environment")
+	cancel()
+	if testEnv == nil {
+		return
+	}
+	if err := testEnv.Stop(); err != nil {
+		log.Printf("failed stopping test environment: %s\n", err)
+	}
 }
 
 const (
