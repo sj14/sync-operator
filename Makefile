@@ -1,9 +1,4 @@
-# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
-ifeq (,$(shell go env GOBIN))
-GOBIN=$(shell go env GOPATH)/bin
-else
-GOBIN=$(shell go env GOBIN)
-endif
+export GOBIN=$(PWD)/bin
 
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
@@ -34,15 +29,15 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	$(CONTROLLER_GEN) crd webhook paths="./..." output:crd:artifacts:config=deploy/crds/
+	bin/controller-gen crd webhook paths="./..." output:crd:artifacts:config=deploy/crds/
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
-	$(CONTROLLER_GEN) object paths="./..."
+	bin/controller-gen object paths="./..."
 
 .PHONY: test
 test: manifests generate envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(1.26.0) --bin-dir $(LOCALBIN) -p path)" go test -race ./... -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell bin/setup-envtest use --bin-dir $(PWD)/bin/ -p path)" go test -race ./... -coverprofile cover.out
 
 ##@ Build
 
@@ -57,47 +52,29 @@ run: manifests generate ## Run a controller from your host.
 
 ##@ Deployment
 
-ifndef ignore-not-found
-  ignore-not-found = false
-endif
-
 .PHONY: install
 install: manifests  ## Install CRDs into the K8s cluster specified in ~/.kube/config.
 	kubectl apply -Rf deploy/crds
 
 .PHONY: uninstall
-uninstall: manifests ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	kubectl delete --ignore-not-found=$(ignore-not-found) -Rf deploy/crds
+uninstall: manifests ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config.
+	kubectl delete --ignore-not-found=true -Rf deploy/crds
 
 .PHONY: deploy
 deploy: manifests ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	kubectl apply -Rf deploy/
 
 .PHONY: undeploy
-undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	kubectl delete --ignore-not-found=$(ignore-not-found) -Rf deploy/
+undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
+	kubectl delete --ignore-not-found=true -Rf deploy/
 
 ##@ Build Dependencies
 
-## Location to install dependencies to
-LOCALBIN ?= $(shell pwd)/bin
-$(LOCALBIN):
-	mkdir -p $(LOCALBIN)
-
 ## Tool Binaries
-CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
-ENVTEST ?= $(LOCALBIN)/setup-envtest
-
-## Tool Versions
-CONTROLLER_TOOLS_VERSION ?= v0.11.1
-
 .PHONY: controller-gen
-controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary. If wrong version is installed, it will be overwritten.
-$(CONTROLLER_GEN): $(LOCALBIN)
-	test -s $(LOCALBIN)/controller-gen && $(LOCALBIN)/controller-gen --version | grep -q $(CONTROLLER_TOOLS_VERSION) || \
-	GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_TOOLS_VERSION)
+controller-gen:
+	cd tools && go install -tags tools sigs.k8s.io/controller-tools/cmd/controller-gen
 
 .PHONY: envtest
-envtest: $(ENVTEST) ## Download envtest-setup locally if necessary.
-$(ENVTEST): $(LOCALBIN)
-	test -s $(LOCALBIN)/setup-envtest || GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+envtest:
+	cd tools && go install -tags tools sigs.k8s.io/controller-runtime/tools/setup-envtest
