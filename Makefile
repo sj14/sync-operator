@@ -73,8 +73,8 @@ undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/confi
 ## Tool Binaries
 .PHONY: controller-gen
 controller-gen:
-	cd tools && go install -tags tools sigs.k8s.io/controller-tools/cmd/controller-gen
+	cd tools && go install sigs.k8s.io/controller-tools/cmd/controller-gen
 
 .PHONY: envtest
 envtest:
-	cd tools && go install -tags tools sigs.k8s.io/controller-runtime/tools/setup-envtest
+	cd tools && go install sigs.k8s.io/controller-runtime/tools/setup-envtest
