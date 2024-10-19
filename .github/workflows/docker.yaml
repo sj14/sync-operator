@@ -3,8 +3,8 @@ on:
   push:
     tags:
       - "*"
-    branches: # necessary, otherwise it won't trigger on "paths" changes
-      - '**'
+    branches:
+      - 'main'
     paths:
       - Dockerfile
       - go.mod

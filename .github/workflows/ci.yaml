@@ -8,6 +8,7 @@ on:
       - ".github/workflows/ci.yaml"
       - tools/**
       - Makefile
+      - deploy/crds/**
 jobs:
   build:
     name: Test
