@@ -4,7 +4,7 @@ go 1.23.4
 
 require (
 	sigs.k8s.io/controller-runtime/tools/setup-envtest v0.0.0-20241206182001-aea2e32a9365
-	sigs.k8s.io/controller-tools v0.16.5
+	sigs.k8s.io/controller-tools v0.17.0
 )
 
 require (
