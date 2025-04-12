@@ -6,13 +6,12 @@ on:
       - go.sum
       - "**.go"
       - ".github/workflows/ci.yaml"
-      - tools/**
       - Makefile
       - deploy/crds/**
 jobs:
   build:
     name: Test
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -23,10 +22,6 @@ jobs:
       - name: Get dependencies
         run: go get -v -t -d ./...
       - name: Go mod tidy
-        run: | 
-          go mod tidy
-          git diff --exit-code
-      - name: Go mod tidy (tools)
         run: | 
           go mod tidy
           git diff --exit-code

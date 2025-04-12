@@ -1,5 +1,3 @@
-export GOBIN=$(PWD)/bin
-
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
 SHELL = /usr/bin/env bash -o pipefail
@@ -28,16 +26,16 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: manifests
-manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	bin/controller-gen crd webhook paths="./..." output:crd:artifacts:config=deploy/crds/
+manifests: ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+	go tool controller-gen crd webhook paths="./..." output:crd:artifacts:config=deploy/crds/
 
 .PHONY: generate
-generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
-	bin/controller-gen object paths="./..."
+generate: ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+	go tool controller-gen object paths="./..."
 
 .PHONY: test
-test: manifests generate envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell bin/setup-envtest use --bin-dir $(PWD)/bin/ -p path)" go test -race ./... -coverprofile cover.out
+test: manifests generate ## Run tests.
+	KUBEBUILDER_ASSETS="$(shell go tool setup-envtest use --bin-dir $(PWD)/bin/ -p path)" go test -race ./... -coverprofile cover.out
 
 ##@ Build
 
@@ -67,14 +65,3 @@ deploy: manifests ## Deploy controller to the K8s cluster specified in ~/.kube/c
 .PHONY: undeploy
 undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
 	kubectl delete --ignore-not-found=true -Rf deploy/
-
-##@ Build Dependencies
-
-## Tool Binaries
-.PHONY: controller-gen
-controller-gen:
-	cd tools && go install sigs.k8s.io/controller-tools/cmd/controller-gen
-
-.PHONY: envtest
-envtest:
-	cd tools && go install sigs.k8s.io/controller-runtime/tools/setup-envtest
