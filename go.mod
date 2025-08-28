@@ -8,7 +8,7 @@ tool (
 )
 
 require (
-	github.com/stretchr/testify v1.11.0
+	github.com/stretchr/testify v1.11.1
 	golang.org/x/exp v0.0.0-20250408133849-7e4ce0ab07d0
 	k8s.io/api v0.33.4
 	k8s.io/apimachinery v0.34.0-alpha.1
