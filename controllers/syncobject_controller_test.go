@@ -108,6 +108,90 @@ func TestIndexByReference(t *testing.T) {
 	require.Nil(t, indexByReference(&corev1.ConfigMap{}))
 }
 
+func TestGetTargetNamespaces(t *testing.T) {
+	const referenceNamespace = "origin-ns"
+
+	tests := []struct {
+		name             string
+		targetNamespaces []string
+		ignoreNamespaces []string
+		wantTargets      []string
+		wantNonTargets   []string
+	}{
+		{
+			name:           "no targets defined syncs to all but the reference namespace",
+			wantTargets:    []string{"a-ns", "b-ns"},
+			wantNonTargets: nil,
+		},
+		{
+			name:             "explicit targets make the rest non-targets",
+			targetNamespaces: []string{"a-ns"},
+			wantTargets:      []string{"a-ns"},
+			wantNonTargets:   []string{"b-ns"},
+		},
+		{
+			name:             "ignored namespaces are dropped from targets and cleaned up",
+			ignoreNamespaces: []string{"b-ns"},
+			wantTargets:      []string{"a-ns"},
+			wantNonTargets:   []string{"b-ns"},
+		},
+		{
+			// the reference namespace holds the original; listing it here
+			// must not turn the original into a deletion candidate.
+			name:             "ignoring the reference namespace never targets it for deletion",
+			ignoreNamespaces: []string{referenceNamespace},
+			wantTargets:      []string{"a-ns", "b-ns"},
+			wantNonTargets:   nil,
+		},
+		{
+			// likewise, explicitly targeting it must not replicate over it.
+			name:             "targeting the reference namespace does not replicate over the original",
+			targetNamespaces: []string{"a-ns", referenceNamespace},
+			wantTargets:      []string{"a-ns"},
+			wantNonTargets:   []string{"b-ns"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().
+				WithObjects(
+					&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: referenceNamespace}},
+					&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "a-ns"}},
+					&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "b-ns"}},
+				).
+				Build()
+
+			r := &SyncObjectReconciler{Client: fakeClient}
+
+			syncObject := syncv1alpha1.SyncObject{
+				Spec: syncv1alpha1.SyncObjectSpec{
+					Reference: syncv1alpha1.Reference{
+						Group:     "",
+						Version:   "v1",
+						Kind:      "ConfigMap",
+						Name:      "cm",
+						Namespace: referenceNamespace,
+					},
+					TargetNamespaces: tt.targetNamespaces,
+					IgnoreNamespaces: tt.ignoreNamespaces,
+				},
+			}
+
+			targets, nonTargets, err := r.getTargetNamespaces(context.Background(), syncObject)
+			require.NoError(t, err)
+
+			require.ElementsMatch(t, tt.wantTargets, targets)
+			require.ElementsMatch(t, tt.wantNonTargets, nonTargets)
+
+			// whatever the configuration, the original must never be a
+			// replication target nor a deletion candidate.
+			require.NotContains(t, targets, referenceNamespace)
+			require.NotContains(t, nonTargets, referenceNamespace)
+		})
+	}
+}
+
 func TestReferencesToCleanUp(t *testing.T) {
 	current := syncv1alpha1.Reference{Group: "", Version: "v1", Kind: "ConfigMap", Name: "current", Namespace: "ns"}
 	previous := syncv1alpha1.Reference{Group: "", Version: "v1", Kind: "ConfigMap", Name: "previous", Namespace: "ns"}

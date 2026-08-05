@@ -263,6 +263,67 @@ func TestControllersIgnoreNamespaces(t *testing.T) {
 	})
 }
 
+// TestControllersKeepsOriginalWhenItsNamespaceIsIgnored guards against
+// destroying the very object being synced: listing the reference's own
+// namespace under ignoreNamespaces used to make it a deletion candidate,
+// so the operator deleted the original it was supposed to replicate.
+func TestControllersKeepsOriginalWhenItsNamespaceIsIgnored(t *testing.T) {
+	ctx := context.Background()
+
+	originNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ignoreorigin-origin-namespace"},
+	}
+	targetNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ignoreorigin-target-namespace"},
+	}
+	originConfigMap := &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ignoreorigin-configmap", Namespace: originNamespace.Name},
+		Data:       map[string]string{"key": "value"},
+	}
+
+	require.NoError(t, k8sClient.Create(ctx, originNamespace))
+	require.NoError(t, k8sClient.Create(ctx, targetNamespace))
+	require.NoError(t, k8sClient.Create(ctx, originConfigMap))
+
+	syncObject := &syncv1alpha1.SyncObject{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sync-ignoreorigin"},
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "",
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Name:      originConfigMap.Name,
+				Namespace: originNamespace.Name,
+			},
+			// the reference's own namespace, which must never be treated
+			// as a namespace to clean replicas out of
+			IgnoreNamespaces: []string{originNamespace.Name},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, syncObject))
+
+	// wait until the operator has done a full pass
+	replicaKey := client.ObjectKey{Namespace: targetNamespace.Name, Name: originConfigMap.Name}
+	require.Eventually(t, func() bool {
+		return k8sClient.Get(ctx, replicaKey, &corev1.ConfigMap{}) == nil
+	}, timeout, interval, "the reference should still be replicated into other namespaces")
+
+	// the original must have survived that pass
+	fetched := &corev1.ConfigMap{}
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(originConfigMap), fetched),
+		"the original must not be deleted just because its namespace is ignored")
+	require.Equal(t, map[string]string{"key": "value"}, fetched.Data)
+
+	// and it must stay that way across further reconciles
+	require.Never(t, func() bool {
+		return apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(originConfigMap), &corev1.ConfigMap{}))
+	}, 2*time.Second, interval, "the original must not be deleted by a later reconcile either")
+}
+
 // TestControllersReplacesReplicasWhenReferenceChanges covers issue #9:
 // pointing spec.reference at a different object must not leave the previous
 // reference's replicas behind, since they're named after the old reference

@@ -282,11 +282,18 @@ func (r *SyncObjectReconciler) requestsForReferenced(ctx context.Context, obj *u
 	return requests
 }
 
-// TODO: add unit test
-// returns target and non-target namespaces
+// getTargetNamespaces returns the namespaces to replicate the reference
+// into, and the namespaces to clean up leftover replicas from.
+//
+// The reference's own namespace appears in neither list: it holds the
+// original, which must never be overwritten by a replica nor deleted as if
+// it were one -- not even when the user listed it in targetNamespaces or
+// ignoreNamespaces.
 func (r *SyncObjectReconciler) getTargetNamespaces(ctx context.Context, syncObject syncv1alpha1.SyncObject) ([]string, []string, error) {
-	targetNamespaces := syncObject.Spec.TargetNamespaces
-	nonTargetNamespaces := syncObject.Spec.IgnoreNamespaces
+	// cloned: appending to a spec field's slice could otherwise write into
+	// the SyncObject's own backing array.
+	targetNamespaces := slices.Clone(syncObject.Spec.TargetNamespaces)
+	nonTargetNamespaces := slices.Clone(syncObject.Spec.IgnoreNamespaces)
 
 	var allNamespaces corev1.NamespaceList
 
@@ -297,26 +304,16 @@ func (r *SyncObjectReconciler) getTargetNamespaces(ctx context.Context, syncObje
 	// no namespaces defined, sync to all of them
 	if len(targetNamespaces) == 0 {
 		for _, namespace := range allNamespaces.Items {
-			if namespace.GetName() == syncObject.Spec.Reference.Namespace {
-				// don't create a replica in the reference namespace
-				continue
-			}
 			targetNamespaces = append(targetNamespaces, namespace.GetName())
 		}
 	}
 
 	// we only sync to specified namespaces, check which are nonTarget namespaces
 	// so we can delete replicas there if there are some leftovers
-	if len(targetNamespaces) > 0 {
-		for _, namespace := range allNamespaces.Items {
-			if namespace.GetName() == syncObject.Spec.Reference.Namespace {
-				// don't remove reference
-				continue
-			}
-			if !slices.Contains(targetNamespaces, namespace.GetName()) {
-				// namespace is not a target
-				nonTargetNamespaces = append(nonTargetNamespaces, namespace.GetName())
-			}
+	for _, namespace := range allNamespaces.Items {
+		if !slices.Contains(targetNamespaces, namespace.GetName()) {
+			// namespace is not a target
+			nonTargetNamespaces = append(nonTargetNamespaces, namespace.GetName())
 		}
 	}
 
@@ -324,6 +321,12 @@ func (r *SyncObjectReconciler) getTargetNamespaces(ctx context.Context, syncObje
 	for _, ignoreNamespace := range syncObject.Spec.IgnoreNamespaces {
 		targetNamespaces = remove(targetNamespaces, ignoreNamespace)
 	}
+
+	// the original is not a replica: don't replicate over it, and don't
+	// delete it.
+	referenceNamespace := syncObject.Spec.Reference.Namespace
+	targetNamespaces = remove(targetNamespaces, referenceNamespace)
+	nonTargetNamespaces = remove(nonTargetNamespaces, referenceNamespace)
 
 	return targetNamespaces, nonTargetNamespaces, nil
 }
