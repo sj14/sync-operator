@@ -35,7 +35,7 @@ generate: ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject
 
 .PHONY: test
 test: manifests generate ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell go tool setup-envtest use --bin-dir $(PWD)/bin/ -p path)" go test -race ./... -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell go tool setup-envtest use --bin-dir $(PWD)/bin/ -p path)" go test -race -count=1 ./... -coverprofile cover.out
 
 ##@ Build
 

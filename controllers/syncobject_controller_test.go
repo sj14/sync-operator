@@ -9,8 +9,10 @@ import (
 	syncv1alpha1 "github.com/sj14/sync-operator/api/v1alpha1"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -424,6 +426,70 @@ func TestDeleteReplicasKeepsGivenNamespaces(t *testing.T) {
 
 	require.True(t, exists("keep-me"), "a replica in a namespace that is still a target should survive")
 	require.False(t, exists("drop-me"), "a replica outside the target namespaces should be deleted")
+}
+
+// TestDeleteReplicasToleratesUnknownKind covers the referenced kind being
+// removed from the cluster, e.g. its CRD was uninstalled. The API server
+// has already removed the objects of that kind, so there is nothing to
+// clean up -- and reporting an error would leave the SyncObject stuck in
+// Terminating, because its finalizer could never complete.
+func TestDeleteReplicasToleratesUnknownKind(t *testing.T) {
+	noMatch := &meta.NoKindMatchError{
+		GroupKind:        schema.GroupKind{Group: "example.com", Kind: "Gone"},
+		SearchedVersions: []string{"v1"},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				return noMatch
+			},
+		}).
+		Build()
+
+	r := &SyncObjectReconciler{Client: fakeClient}
+
+	require.NoError(t, r.deleteReplicas(context.Background(), testSyncObject, testRef, nil),
+		"a kind that no longer exists means there is nothing left to delete")
+}
+
+// TestHandleFinalizerCompletesWhenKindIsUnknown is the reason the above
+// matters: a SyncObject whose kind has disappeared must still be deletable.
+func TestHandleFinalizerCompletesWhenKindIsUnknown(t *testing.T) {
+	deletionTimestamp := metav1.Now()
+	syncObject := &syncv1alpha1.SyncObject{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              testSyncObject.Name,
+			Finalizers:        []string{finalizerName},
+			DeletionTimestamp: &deletionTimestamp,
+		},
+		Spec: syncv1alpha1.SyncObjectSpec{Reference: testRef},
+	}
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, syncv1alpha1.AddToScheme(scheme))
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(syncObject).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				return &meta.NoKindMatchError{
+					GroupKind:        schema.GroupKind{Group: testRef.Group, Kind: testRef.Kind},
+					SearchedVersions: []string{testRef.Version},
+				}
+			},
+		}).
+		Build()
+
+	r := &SyncObjectReconciler{Client: fakeClient}
+
+	stop, err := r.handleFinalizer(context.Background(), syncObject)
+	require.NoError(t, err)
+	require.True(t, stop, "reconciliation should stop, the object is being deleted")
+	require.NotContains(t, syncObject.Finalizers, finalizerName,
+		"the finalizer must be removed, otherwise the SyncObject is stuck in Terminating forever")
 }
 
 func TestDeleteReplicasPropagatesErrors(t *testing.T) {

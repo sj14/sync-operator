@@ -12,6 +12,7 @@ import (
 	syncv1alpha1 "github.com/sj14/sync-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -151,9 +152,16 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		multiErr = errors.Join(multiErr, fmt.Errorf("failed cleaning up replicas: %v", err))
 	}
 
-	for _, namespace := range targetNamespaces {
-		if err := r.replicate(ctx, syncObject, namespace); err != nil {
-			multiErr = errors.Join(multiErr, fmt.Errorf("failed creating replica: %v", err))
+	// fetched once rather than per namespace: every replica is a copy of the
+	// same object anyway
+	original, err := r.getOriginal(ctx, syncObject.Spec.Reference)
+	if err != nil {
+		multiErr = errors.Join(multiErr, err)
+	} else {
+		for _, namespace := range targetNamespaces {
+			if err := r.replicate(ctx, syncObject, original, namespace); err != nil {
+				multiErr = errors.Join(multiErr, fmt.Errorf("failed creating replica: %v", err))
+			}
 		}
 	}
 
@@ -394,17 +402,31 @@ func remove(slice []string, s string) []string {
 	})
 }
 
-// TODO: Add finalizer, ownerreference?
-func (r *SyncObjectReconciler) replicate(ctx context.Context, syncObject syncv1alpha1.SyncObject, namespace string) error {
-	ref := syncObject.Spec.Reference
-
+// getOriginal fetches the object the reference points at.
+//
+// A replica is refused as a source. Replicating a replica means two
+// SyncObjects managing objects of the same kind and name: they would
+// overwrite each other's copies on every pass, and because the chain keeps
+// the original's name, the second one would eventually overwrite the
+// original itself.
+func (r *SyncObjectReconciler) getOriginal(ctx context.Context, ref syncv1alpha1.Reference) (*unstructured.Unstructured, error) {
 	var original unstructured.Unstructured
 	original.SetGroupVersionKind(ref.GroupVersionKind())
 
 	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, &original); err != nil {
-		return fmt.Errorf("failed getting original object: %v", err)
+		return nil, fmt.Errorf("failed getting original object: %v", err)
 	}
 
+	if original.GetLabels()[managedByLabel] == managedByValue {
+		return nil, fmt.Errorf("refusing to replicate %s %s/%s: it is itself a replica, created by the SyncObject %q; reference that SyncObject's own source instead",
+			ref.Kind, ref.Namespace, ref.Name, original.GetAnnotations()[syncObjectAnnotation])
+	}
+
+	return &original, nil
+}
+
+// TODO: Add finalizer, ownerreference?
+func (r *SyncObjectReconciler) replicate(ctx context.Context, syncObject syncv1alpha1.SyncObject, original *unstructured.Unstructured, namespace string) error {
 	replica := original.DeepCopy()
 	replica.SetNamespace(namespace)
 
@@ -468,6 +490,14 @@ func (r *SyncObjectReconciler) deleteReplicas(ctx context.Context, syncObject sy
 	// the label narrows this down server side; the annotations below then
 	// pin it to this SyncObject and this particular reference.
 	if err := r.Client.List(ctx, &candidates, client.MatchingLabels{managedByLabel: managedByValue}); err != nil {
+		if meta.IsNoMatchError(err) {
+			// The kind itself is gone from the cluster, so the API server
+			// has already removed everything of that kind, replicas
+			// included. Treating this as an error instead would leave the
+			// SyncObject stuck in Terminating, since the finalizer could
+			// never complete.
+			return nil
+		}
 		return fmt.Errorf("failed listing replicas: %v", err)
 	}
 

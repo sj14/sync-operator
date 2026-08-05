@@ -83,3 +83,5 @@ kubectl get configmaps -A -l sync.sj14.github.io/managed-by=sync-operator
 ```
 
 These marks are also how the operator decides what it may delete. It only ever removes objects it created itself, matched by the marks above rather than by name, so an existing resource that happens to share a name with a replica is left alone.
+
+A replica cannot be used as the `reference` of another `SyncObject`. Both would end up managing objects of the same kind and name and overwrite each other's copies on every pass.

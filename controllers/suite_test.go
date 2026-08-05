@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -106,6 +107,25 @@ const (
 	timeout  = 10 * time.Second
 	interval = 250 * time.Millisecond
 )
+
+// updateWithRetry re-reads obj, applies mutate and writes it back, retrying
+// on conflict.
+//
+// The operator writes to these same objects -- the SyncObject's status, and
+// the replicas themselves -- so a plain read-modify-write races with it and
+// intermittently loses with "the object has been modified".
+func updateWithRetry(ctx context.Context, t *testing.T, obj client.Object, mutate func()) {
+	t.Helper()
+
+	key := client.ObjectKeyFromObject(obj)
+	require.NoError(t, retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := k8sClient.Get(ctx, key, obj); err != nil {
+			return err
+		}
+		mutate()
+		return k8sClient.Update(ctx, obj)
+	}))
+}
 
 func TestControllersCreateDelete(t *testing.T) {
 	ctx := context.Background()
@@ -344,6 +364,88 @@ func TestControllersMarksReplicas(t *testing.T) {
 	require.True(t, found, "the replica should be findable by the managed-by label")
 }
 
+// TestControllersRefusesToReplicateAReplica covers pointing a SyncObject at
+// something that is already a replica. Both SyncObjects would manage objects
+// of the same kind and name, overwriting each other's copies on every pass,
+// and since the chain keeps the original's name the second one would
+// eventually overwrite the original too.
+func TestControllersRefusesToReplicateAReplica(t *testing.T) {
+	ctx := context.Background()
+
+	originNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "chain-origin-namespace"},
+	}
+	firstTarget := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "chain-first-target"},
+	}
+	secondTarget := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "chain-second-target"},
+	}
+	originConfigMap := &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "chain-configmap", Namespace: originNamespace.Name},
+		Data:       map[string]string{"key": "value"},
+	}
+
+	require.NoError(t, k8sClient.Create(ctx, originNamespace))
+	require.NoError(t, k8sClient.Create(ctx, firstTarget))
+	require.NoError(t, k8sClient.Create(ctx, secondTarget))
+	require.NoError(t, k8sClient.Create(ctx, originConfigMap))
+
+	first := &syncv1alpha1.SyncObject{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sync-chain-first"},
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "",
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Name:      originConfigMap.Name,
+				Namespace: originNamespace.Name,
+			},
+			TargetNamespaces: []string{firstTarget.Name},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, first))
+
+	replicaKey := client.ObjectKey{Namespace: firstTarget.Name, Name: originConfigMap.Name}
+	require.Eventually(t, func() bool {
+		return k8sClient.Get(ctx, replicaKey, &corev1.ConfigMap{}) == nil
+	}, timeout, interval, "the first SyncObject should have made a replica")
+
+	// now point a second SyncObject at that replica
+	second := &syncv1alpha1.SyncObject{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sync-chain-second"},
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "",
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Name:      originConfigMap.Name,
+				Namespace: firstTarget.Name,
+			},
+			TargetNamespaces: []string{secondTarget.Name},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, second))
+
+	// it must never get anywhere
+	chainedKey := client.ObjectKey{Namespace: secondTarget.Name, Name: originConfigMap.Name}
+	require.Never(t, func() bool {
+		return k8sClient.Get(ctx, chainedKey, &corev1.ConfigMap{}) == nil
+	}, 3*time.Second, interval, "a replica of a replica should never be created")
+
+	// and the first SyncObject's replica is left exactly as it was
+	replica := &corev1.ConfigMap{}
+	require.NoError(t, k8sClient.Get(ctx, replicaKey, replica))
+	require.Equal(t, first.Name, replica.Annotations[syncObjectAnnotation],
+		"the original owner of the replica should not have been taken over")
+}
+
 // TestControllersRepairsReplicaDrift covers a replica being tampered with
 // directly. The SyncObject keeps its default 1h resync interval, so a
 // repair inside the short Eventually window can only come from the watch
@@ -393,9 +495,9 @@ func TestControllersRepairsReplicaDrift(t *testing.T) {
 	}, timeout, interval)
 
 	t.Run("an edited replica is restored", func(t *testing.T) {
-		require.NoError(t, k8sClient.Get(ctx, replicaKey, replica))
-		replica.Data = map[string]string{"key": "tampered"}
-		require.NoError(t, k8sClient.Update(ctx, replica))
+		updateWithRetry(ctx, t, replica, func() {
+			replica.Data = map[string]string{"key": "tampered"}
+		})
 
 		require.Eventually(t, func() bool {
 			if err := k8sClient.Get(ctx, replicaKey, replica); err != nil {
@@ -600,9 +702,9 @@ func TestControllersReplacesReplicasWhenReferenceChanges(t *testing.T) {
 	}, timeout, interval, "the first reference should have been replicated")
 
 	// repoint the SyncObject at the other ConfigMap
-	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(syncObject), syncObject))
-	syncObject.Spec.Reference.Name = secondOrigin.Name
-	require.NoError(t, k8sClient.Update(ctx, syncObject))
+	updateWithRetry(ctx, t, syncObject, func() {
+		syncObject.Spec.Reference.Name = secondOrigin.Name
+	})
 
 	require.Eventually(t, func() bool {
 		return k8sClient.Get(ctx, secondReplica, &corev1.ConfigMap{}) == nil
