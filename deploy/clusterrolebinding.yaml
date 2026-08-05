@@ -43,17 +43,17 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   labels:
-    app.kubernetes.io/component: kube-rbac-proxy
+    app.kubernetes.io/component: metrics
     app.kubernetes.io/created-by: sync-operator
-    app.kubernetes.io/instance: proxy-rolebinding
+    app.kubernetes.io/instance: metrics-auth-rolebinding
     app.kubernetes.io/managed-by: kustomize
     app.kubernetes.io/name: clusterrolebinding
     app.kubernetes.io/part-of: sync-operator
-  name: sync-operator-proxy-rolebinding
+  name: sync-operator-metrics-auth-rolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: sync-operator-proxy-role
+  name: sync-operator-metrics-auth-role
 subjects:
   - kind: ServiceAccount
     name: sync-operator
