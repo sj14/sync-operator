@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 
 	syncv1alpha1 "github.com/sj14/sync-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -26,6 +27,9 @@ type SyncObjectReconciler struct {
 }
 
 const finalizerName = "sync.sj14.github.io/finalizer"
+
+// defaultInterval is used when SyncObjectSpec.Interval is not set.
+const defaultInterval = 1 * time.Hour
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -79,7 +83,16 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	// when there was no error, requeue after <interval> to keep changes in sync.
-	return ctrl.Result{RequeueAfter: syncObject.Spec.Interval.Duration}, nil
+	return ctrl.Result{RequeueAfter: syncInterval(syncObject)}, nil
+}
+
+// syncInterval returns the configured sync interval, falling back to
+// defaultInterval when none was set on the SyncObject.
+func syncInterval(syncObject syncv1alpha1.SyncObject) time.Duration {
+	if syncObject.Spec.Interval.Duration == 0 {
+		return defaultInterval
+	}
+	return syncObject.Spec.Interval.Duration
 }
 
 func (r *SyncObjectReconciler) handleFinalizer(ctx context.Context, syncObject *syncv1alpha1.SyncObject) (stop bool, err error) {

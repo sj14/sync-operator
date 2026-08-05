@@ -49,8 +49,8 @@ spec:
                   type: string
                 type: array
               interval:
-                description: Interval for syncing the reference resource. The default
-                  interval is 10 hours.
+                default: 1h
+                description: Interval for syncing the reference resource.
                 type: string
               reference:
                 properties:

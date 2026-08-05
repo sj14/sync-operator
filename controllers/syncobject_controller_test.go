@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	syncv1alpha1 "github.com/sj14/sync-operator/api/v1alpha1"
 	"github.com/stretchr/testify/require"
@@ -45,6 +46,28 @@ func TestRemove(t *testing.T) {
 			original := append([]string(nil), tt.slice...)
 			remove(tt.slice, tt.elem)
 			require.Equal(t, original, tt.slice)
+		})
+	}
+}
+
+func TestSyncInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval time.Duration
+		want     time.Duration
+	}{
+		{"unset falls back to default", 0, defaultInterval},
+		{"explicit value is preserved", 30 * time.Minute, 30 * time.Minute},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			syncObject := syncv1alpha1.SyncObject{
+				Spec: syncv1alpha1.SyncObjectSpec{
+					Interval: metav1.Duration{Duration: tt.interval},
+				},
+			}
+			require.Equal(t, tt.want, syncInterval(syncObject))
 		})
 	}
 }

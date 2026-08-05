@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -260,6 +261,43 @@ func TestControllersIgnoreNamespaces(t *testing.T) {
 		err := k8sClient.Get(ctx, key, replica)
 		require.True(t, apierrors.IsNotFound(err), "expected no replica in an ignored namespace, got: %v", err)
 	})
+}
+
+// TestCRDDefaultsInterval creates a SyncObject as raw, unstructured JSON that
+// omits the "interval" field entirely, the way a hand-written YAML manifest
+// would. This is deliberately not done via the typed client: metav1.Duration
+// is a struct, and Go's encoding/json never treats "omitempty" struct fields
+// as empty, so the typed client always sends an explicit "interval":"0s" and
+// the CRD default would never get a chance to apply.
+func TestCRDDefaultsInterval(t *testing.T) {
+	ctx := context.Background()
+
+	u := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "sync.sj14.github.io/v1alpha1",
+			"kind":       "SyncObject",
+			"metadata": map[string]interface{}{
+				"name": "sync-defaultinterval-test",
+			},
+			"spec": map[string]interface{}{
+				"reference": map[string]interface{}{
+					"group":     "",
+					"version":   "v1",
+					"kind":      "ConfigMap",
+					"name":      "does-not-need-to-exist",
+					"namespace": "default",
+				},
+			},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, u))
+
+	var syncObject syncv1alpha1.SyncObject
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(u), &syncObject))
+
+	// the generated CRD (deploy/crds/sync.sj14.github.io_syncobjects.yaml) and
+	// the controller's own fallback (syncInterval) must agree on the default.
+	require.Equal(t, defaultInterval, syncObject.Spec.Interval.Duration)
 }
 
 // helper as gvk would be missing after creation
