@@ -14,6 +14,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	syncv1alpha1 "github.com/sj14/sync-operator/api/v1alpha1"
@@ -32,9 +33,10 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr          = flag.String("metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
+		metricsAddr          = flag.String("metrics-bind-address", ":8443", "The address the metrics endpoint binds to. Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 		probeAddr            = flag.String("health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 		enableLeaderElection = flag.Bool("leader-elect", false, "Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager.")
+		secureMetrics        = flag.Bool("metrics-secure", true, "If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	)
 
 	opts := zap.Options{
@@ -45,11 +47,20 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	metricsServerOptions := server.Options{
+		BindAddress: *metricsAddr,
+	}
+	if *secureMetrics {
+		metricsServerOptions.SecureServing = true
+		// FilterProvider is used to protect the metrics endpoint with authn/authz.
+		// These configurations ensure that only authorized users and service accounts
+		// can access the metrics endpoint. The RBAC are configured in deploy/clusterrole.yaml.
+		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme: scheme,
-		Metrics: server.Options{
-			BindAddress: *metricsAddr,
-		},
+		Scheme:  scheme,
+		Metrics: metricsServerOptions,
 		// WebhookServer:          webhook.NewServer(webhook.Options{Port: 9443}),
 		HealthProbeBindAddress: *probeAddr,
 		LeaderElection:         *enableLeaderElection,
