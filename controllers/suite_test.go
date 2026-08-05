@@ -263,6 +263,146 @@ func TestControllersIgnoreNamespaces(t *testing.T) {
 	})
 }
 
+// TestControllersRepairsReplicaDrift covers a replica being tampered with
+// directly. The SyncObject keeps its default 1h resync interval, so a
+// repair inside the short Eventually window can only come from the watch
+// on the reference's kind, which is cluster wide and therefore sees the
+// replicas too.
+func TestControllersRepairsReplicaDrift(t *testing.T) {
+	ctx := context.Background()
+
+	originNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "drift-origin-namespace"},
+	}
+	targetNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "drift-target-namespace"},
+	}
+	originConfigMap := &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "drift-configmap", Namespace: originNamespace.Name},
+		Data:       map[string]string{"key": "original"},
+	}
+
+	require.NoError(t, k8sClient.Create(ctx, originNamespace))
+	require.NoError(t, k8sClient.Create(ctx, targetNamespace))
+	require.NoError(t, k8sClient.Create(ctx, originConfigMap))
+
+	syncObject := &syncv1alpha1.SyncObject{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sync-drift"},
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "",
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Name:      originConfigMap.Name,
+				Namespace: originNamespace.Name,
+			},
+			TargetNamespaces: []string{targetNamespace.Name},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, syncObject))
+
+	replicaKey := client.ObjectKey{Namespace: targetNamespace.Name, Name: originConfigMap.Name}
+	replica := &corev1.ConfigMap{}
+	require.Eventually(t, func() bool {
+		return k8sClient.Get(ctx, replicaKey, replica) == nil
+	}, timeout, interval)
+
+	t.Run("an edited replica is restored", func(t *testing.T) {
+		require.NoError(t, k8sClient.Get(ctx, replicaKey, replica))
+		replica.Data = map[string]string{"key": "tampered"}
+		require.NoError(t, k8sClient.Update(ctx, replica))
+
+		require.Eventually(t, func() bool {
+			if err := k8sClient.Get(ctx, replicaKey, replica); err != nil {
+				return false
+			}
+			return replica.Data["key"] == "original"
+		}, timeout, interval, "the replica should have been restored from the original")
+	})
+
+	t.Run("a deleted replica is recreated", func(t *testing.T) {
+		require.NoError(t, k8sClient.Get(ctx, replicaKey, replica))
+		require.NoError(t, k8sClient.Delete(ctx, replica))
+
+		require.Eventually(t, func() bool {
+			return k8sClient.Get(ctx, replicaKey, &corev1.ConfigMap{}) == nil
+		}, timeout, interval, "the replica should have been recreated")
+	})
+
+	// The operator reacting to its own writes must not turn into a hot
+	// loop: once settled, nothing should keep rewriting the replica.
+	t.Run("reconciling settles instead of looping", func(t *testing.T) {
+		require.NoError(t, k8sClient.Get(ctx, replicaKey, replica))
+		settled := replica.ResourceVersion
+
+		require.Never(t, func() bool {
+			current := &corev1.ConfigMap{}
+			if err := k8sClient.Get(ctx, replicaKey, current); err != nil {
+				return false
+			}
+			return current.ResourceVersion != settled
+		}, 3*time.Second, 250*time.Millisecond, "the replica keeps being rewritten, the operator is reacting to its own updates")
+	})
+}
+
+// TestControllersReplicatesIntoNewNamespace covers a namespace created
+// after the SyncObject. With targetNamespaces empty every namespace is a
+// target, and nothing about the referenced object changes here, so only the
+// namespace watch can trigger this before the 1h resync.
+func TestControllersReplicatesIntoNewNamespace(t *testing.T) {
+	ctx := context.Background()
+
+	originNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "nswatch-origin-namespace"},
+	}
+	originConfigMap := &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "nswatch-configmap", Namespace: originNamespace.Name},
+		Data:       map[string]string{"key": "value"},
+	}
+
+	require.NoError(t, k8sClient.Create(ctx, originNamespace))
+	require.NoError(t, k8sClient.Create(ctx, originConfigMap))
+
+	syncObject := &syncv1alpha1.SyncObject{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sync-nswatch"},
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "",
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Name:      originConfigMap.Name,
+				Namespace: originNamespace.Name,
+			},
+			// no TargetNamespaces: every namespace is a target
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, syncObject))
+
+	// let the initial pass finish before adding the namespace
+	require.Eventually(t, func() bool {
+		key := client.ObjectKey{Namespace: "default", Name: originConfigMap.Name}
+		return k8sClient.Get(ctx, key, &corev1.ConfigMap{}) == nil
+	}, timeout, interval, "the initial replication should have happened")
+
+	lateNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "nswatch-late-namespace"},
+	}
+	require.NoError(t, k8sClient.Create(ctx, lateNamespace))
+
+	require.Eventually(t, func() bool {
+		key := client.ObjectKey{Namespace: lateNamespace.Name, Name: originConfigMap.Name}
+		return k8sClient.Get(ctx, key, &corev1.ConfigMap{}) == nil
+	}, timeout, interval, "a namespace created later should get its replica without waiting for the resync")
+}
+
 // TestControllersKeepsOriginalWhenItsNamespaceIsIgnored guards against
 // destroying the very object being synced: listing the reference's own
 // namespace under ignoreNamespaces used to make it a deletion candidate,

@@ -10,6 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -72,16 +74,16 @@ func TestResyncInterval(t *testing.T) {
 	}
 }
 
-func TestReferenceKey(t *testing.T) {
-	base := referenceKey("group", "v1", "Kind", "ns", "name")
-	require.Equal(t, base, referenceKey("group", "v1", "Kind", "ns", "name"), "same fields must produce the same key")
+func TestReferencedObjectKey(t *testing.T) {
+	gvk := schema.GroupVersionKind{Group: "group", Version: "v1", Kind: "Kind"}
+	base := referencedObjectKey(gvk, "name")
+	require.Equal(t, base, referencedObjectKey(gvk, "name"), "same fields must produce the same key")
 
 	variants := []string{
-		referenceKey("other", "v1", "Kind", "ns", "name"),
-		referenceKey("group", "v2", "Kind", "ns", "name"),
-		referenceKey("group", "v1", "Other", "ns", "name"),
-		referenceKey("group", "v1", "Kind", "other-ns", "name"),
-		referenceKey("group", "v1", "Kind", "ns", "other-name"),
+		referencedObjectKey(schema.GroupVersionKind{Group: "other", Version: "v1", Kind: "Kind"}, "name"),
+		referencedObjectKey(schema.GroupVersionKind{Group: "group", Version: "v2", Kind: "Kind"}, "name"),
+		referencedObjectKey(schema.GroupVersionKind{Group: "group", Version: "v1", Kind: "Other"}, "name"),
+		referencedObjectKey(gvk, "other-name"),
 	}
 	for _, v := range variants {
 		require.NotEqual(t, base, v, "changing a single field must change the key")
@@ -89,19 +91,28 @@ func TestReferenceKey(t *testing.T) {
 }
 
 func TestIndexByReference(t *testing.T) {
-	syncObject := &syncv1alpha1.SyncObject{
-		Spec: syncv1alpha1.SyncObjectSpec{
-			Reference: syncv1alpha1.Reference{
-				Group:     "apps",
-				Version:   "v1",
-				Kind:      "Deployment",
-				Name:      "my-deploy",
-				Namespace: "my-ns",
-			},
-		},
+	ref := syncv1alpha1.Reference{
+		Group:     "apps",
+		Version:   "v1",
+		Kind:      "Deployment",
+		Name:      "my-deploy",
+		Namespace: "my-ns",
 	}
-	want := []string{referenceKey("apps", "v1", "Deployment", "my-ns", "my-deploy")}
+	syncObject := &syncv1alpha1.SyncObject{
+		Spec: syncv1alpha1.SyncObjectSpec{Reference: ref},
+	}
+
+	want := []string{referencedObjectKey(ref.GroupVersionKind(), ref.Name)}
 	require.Equal(t, want, indexByReference(syncObject))
+
+	// A replica differs from the original only by namespace, so it has to
+	// land on the same key -- that's what lets an event for a replica find
+	// the SyncObject that owns it.
+	replica := &unstructured.Unstructured{}
+	replica.SetGroupVersionKind(ref.GroupVersionKind())
+	replica.SetNamespace("some-other-namespace")
+	replica.SetName(ref.Name)
+	require.Equal(t, want[0], referencedObjectKey(replica.GroupVersionKind(), replica.GetName()))
 
 	// indexByReference is registered against the SyncObject type; anything
 	// else should be ignored rather than panic.

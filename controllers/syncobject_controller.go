@@ -191,7 +191,7 @@ func (r *SyncObjectReconciler) handleFinalizer(ctx context.Context, syncObject *
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *SyncObjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &syncv1alpha1.SyncObject{}, referenceIndexKey, indexByReference); err != nil {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &syncv1alpha1.SyncObject{}, referencedObjectIndexKey, indexByReference); err != nil {
 		return fmt.Errorf("failed indexing SyncObject by reference: %w", err)
 	}
 
@@ -200,6 +200,8 @@ func (r *SyncObjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	c, err := ctrl.NewControllerManagedBy(mgr).
 		For(&syncv1alpha1.SyncObject{}).
+		// a namespace created later may need replicas of its own
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.requestsForNamespace)).
 		Build(r)
 	if err != nil {
 		return err
@@ -209,15 +211,19 @@ func (r *SyncObjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return nil
 }
 
-// referenceIndexKey is the field index used to look up SyncObjects by the
-// object their Reference points at.
-const referenceIndexKey = "spec.reference"
+// referencedObjectIndexKey is the field index used to look up the
+// SyncObjects that care about a given object.
+const referencedObjectIndexKey = "spec.reference.gvkAndName"
 
-// referenceKey returns a stable key identifying the object a Reference
-// points at. It's used both to index SyncObjects by their Reference and to
-// look them back up from a watched object's own GVK/namespace/name.
-func referenceKey(group, version, kind, namespace, name string) string {
-	return strings.Join([]string{group, version, kind, namespace, name}, "/")
+// referencedObjectKey returns a stable key identifying an object a
+// SyncObject manages.
+//
+// The namespace is deliberately left out: a replica differs from its
+// original only by namespace, so this key matches both. That's what lets an
+// event for a replica find the SyncObject that owns it, and not just events
+// for the original.
+func referencedObjectKey(gvk schema.GroupVersionKind, name string) string {
+	return strings.Join([]string{gvk.Group, gvk.Version, gvk.Kind, name}, "/")
 }
 
 func indexByReference(obj client.Object) []string {
@@ -226,15 +232,19 @@ func indexByReference(obj client.Object) []string {
 		return nil
 	}
 	ref := syncObject.Spec.Reference
-	return []string{referenceKey(ref.Group, ref.Version, ref.Kind, ref.Namespace, ref.Name)}
+	return []string{referencedObjectKey(ref.GroupVersionKind(), ref.Name)}
 }
 
 // ensureReferenceWatch makes sure changes to objects of ref's
 // GroupVersionKind trigger a reconcile, instead of only being picked up on
 // the next periodic resync. It's a no-op once a GVK has successfully been
 // watched once.
+//
+// The informer behind this watch is cluster wide, so it covers the replicas
+// as well as the original: editing or deleting a replica by hand is undone
+// straight away rather than at the next resync.
 func (r *SyncObjectReconciler) ensureReferenceWatch(ctx context.Context, ref syncv1alpha1.Reference) error {
-	gvk := schema.GroupVersionKind{Group: ref.Group, Version: ref.Version, Kind: ref.Kind}
+	gvk := ref.GroupVersionKind()
 
 	r.watchedGVKsMu.Lock()
 	_, ok := r.watchedGVKs[gvk]
@@ -247,7 +257,7 @@ func (r *SyncObjectReconciler) ensureReferenceWatch(ctx context.Context, ref syn
 	watched.SetGroupVersionKind(gvk)
 
 	mapFn := func(ctx context.Context, obj *unstructured.Unstructured) []reconcile.Request {
-		return r.requestsForReferenced(ctx, obj)
+		return r.requestsForObject(ctx, obj)
 	}
 
 	src := source.Kind(r.cache, watched, handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](mapFn))
@@ -262,21 +272,42 @@ func (r *SyncObjectReconciler) ensureReferenceWatch(ctx context.Context, ref syn
 	return nil
 }
 
-// requestsForReferenced finds the SyncObjects (if any) whose Reference
-// points at obj, so a change to the referenced object can trigger their
-// reconcile immediately instead of waiting for the periodic resync.
-func (r *SyncObjectReconciler) requestsForReferenced(ctx context.Context, obj *unstructured.Unstructured) []reconcile.Request {
-	gvk := obj.GroupVersionKind()
-	key := referenceKey(gvk.Group, gvk.Version, gvk.Kind, obj.GetNamespace(), obj.GetName())
+// requestsForObject finds the SyncObjects (if any) that manage obj, whether
+// it's their original or one of its replicas, so a change to either
+// triggers a reconcile immediately instead of waiting for the resync.
+func (r *SyncObjectReconciler) requestsForObject(ctx context.Context, obj *unstructured.Unstructured) []reconcile.Request {
+	key := referencedObjectKey(obj.GroupVersionKind(), obj.GetName())
 
 	var syncObjects syncv1alpha1.SyncObjectList
-	if err := r.Client.List(ctx, &syncObjects, client.MatchingFields{referenceIndexKey: key}); err != nil {
-		log.FromContext(ctx).Error(err, "failed listing SyncObjects for referenced object", "gvk", gvk, "namespace", obj.GetNamespace(), "name", obj.GetName())
+	if err := r.Client.List(ctx, &syncObjects, client.MatchingFields{referencedObjectIndexKey: key}); err != nil {
+		log.FromContext(ctx).Error(err, "failed listing SyncObjects for object", "gvk", obj.GroupVersionKind(), "namespace", obj.GetNamespace(), "name", obj.GetName())
 		return nil
 	}
 
 	requests := make([]reconcile.Request, 0, len(syncObjects.Items))
 	for _, syncObject := range syncObjects.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&syncObject)})
+	}
+	return requests
+}
+
+// requestsForNamespace enqueues the SyncObjects that would replicate into
+// the given namespace, so a namespace created after the fact gets its
+// replicas immediately instead of at the next resync.
+func (r *SyncObjectReconciler) requestsForNamespace(ctx context.Context, namespace client.Object) []reconcile.Request {
+	var syncObjects syncv1alpha1.SyncObjectList
+	if err := r.Client.List(ctx, &syncObjects); err != nil {
+		log.FromContext(ctx).Error(err, "failed listing SyncObjects for namespace", "namespace", namespace.GetName())
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for _, syncObject := range syncObjects.Items {
+		targets := syncObject.Spec.TargetNamespaces
+		// an empty target list means "every namespace", so this one counts too
+		if len(targets) > 0 && !slices.Contains(targets, namespace.GetName()) {
+			continue
+		}
 		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&syncObject)})
 	}
 	return requests

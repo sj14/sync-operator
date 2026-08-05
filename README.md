@@ -6,7 +6,14 @@ A operator for syncing any kind of resources across namespaces.
 
 Most operators for syncing between namespaces only allow this for configmaps and secrets (which might also be most of the use-cases), but they won't be able to sync any other resources. So, I got curious about the limitations and started to build `sync-operator` which can sync all kind of resources.
 
-Since the reference resource can be of any kind, `sync-operator` dynamically starts watching whatever kind is referenced (the first time it sees a `SyncObject` pointing at it) and syncs immediately when that resource changes. `resyncInterval` exists as a fallback for what the watch doesn't cover: a replica edited or deleted directly, a new target namespace appearing, or the watch not being established yet (e.g. the referenced kind's CRD wasn't installed at the time). It defaults to `1h`.
+Since the reference resource can be of any kind, `sync-operator` dynamically starts watching whatever kind is referenced, the first time it sees a `SyncObject` pointing at it. That watch is cluster wide, so it covers both directions in real time:
+
+- the reference changes, and the replicas are updated to match
+- a replica is edited or deleted by hand, and it gets restored from the reference
+
+Namespaces are watched as well, so a namespace created later gets its replicas straight away instead of waiting for a periodic pass.
+
+`resyncInterval` (default `1h`) is what's left over: a safety net for what a watch can't catch, such as the referenced kind's CRD not being installed yet when the `SyncObject` was created, or a missed event. It is not how changes are normally picked up.
 
 ## Deploy
 
@@ -42,7 +49,7 @@ kind: SyncObject
 metadata:
   name: syncobject-sample
 spec:
-  # resyncInterval: 1h      # Fallback drift-correction interval, on top of the real-time watch (defaults to 1h)
+  # resyncInterval: 1h      # Safety-net interval on top of the real-time watches (defaults to 1h)
   # targetNamespaces:       # Namespaces to replicate the reference into (defaults to all namespaces)
   #   - kube-public
   # ignoreNamespaces:       # Namespaces to not replicate into
