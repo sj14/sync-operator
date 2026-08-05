@@ -81,3 +81,5 @@ The reference itself is never marked, only its replicas. So to list every replic
 ```console
 kubectl get configmaps -A -l sync.sj14.github.io/managed-by=sync-operator
 ```
+
+These marks are also how the operator decides what it may delete. It only ever removes objects it created itself, matched by the marks above rather than by name, so an existing resource that happens to share a name with a replica is left alone.

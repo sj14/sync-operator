@@ -135,22 +135,20 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// them again and they'd be orphaned.
 	if applied := syncObject.Status.AppliedReference; applied != nil && *applied != syncObject.Spec.Reference {
 		logger.Info("reference changed, removing replicas of the previous reference", "previous", *applied, "current", syncObject.Spec.Reference)
-		if err := r.deleteAllReplicas(ctx, *applied, syncObject.Spec.Reference); err != nil {
+		if err := r.deleteReplicas(ctx, syncObject, *applied, nil); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed removing replicas of the previous reference: %v", err)
 		}
 	}
 
-	targetNamespaces, nonTargetNamespaces, err := r.getTargetNamespaces(ctx, syncObject)
+	targetNamespaces, err := r.getTargetNamespaces(ctx, syncObject)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed getting target namespaces: %v", err)
 	}
 
 	var multiErr error
 	// cleanup leftovers, e.g. when the targetNamespaces changed
-	for _, namespace := range nonTargetNamespaces {
-		if err := r.deleteReplica(ctx, syncObject.Spec.Reference, namespace); err != nil {
-			multiErr = errors.Join(multiErr, fmt.Errorf("failed cleaning up replica: %v", err))
-		}
+	if err := r.deleteReplicas(ctx, syncObject, syncObject.Spec.Reference, targetNamespaces); err != nil {
+		multiErr = errors.Join(multiErr, fmt.Errorf("failed cleaning up replicas: %v", err))
 	}
 
 	for _, namespace := range targetNamespaces {
@@ -206,11 +204,9 @@ func (r *SyncObjectReconciler) handleFinalizer(ctx context.Context, syncObject *
 			// our finalizer is present, so lets handle any external dependency.
 			// A reference change that was never reconciled leaves replicas of
 			// the previous reference behind too, so clean up both.
-			refs := referencesToCleanUp(*syncObject)
-
 			var multiErr error
-			for _, ref := range refs {
-				if err := r.deleteAllReplicas(ctx, ref, refs...); err != nil {
+			for _, ref := range referencesToCleanUp(*syncObject) {
+				if err := r.deleteReplicas(ctx, *syncObject, ref, nil); err != nil {
 					multiErr = errors.Join(multiErr, err)
 				}
 			}
@@ -359,37 +355,25 @@ func (r *SyncObjectReconciler) requestsForNamespace(ctx context.Context, namespa
 }
 
 // getTargetNamespaces returns the namespaces to replicate the reference
-// into, and the namespaces to clean up leftover replicas from.
+// into. Replicas anywhere else are cleaned up by deleteReplicas, which
+// finds them by their marks rather than by namespace.
 //
-// The reference's own namespace appears in neither list: it holds the
-// original, which must never be overwritten by a replica nor deleted as if
-// it were one -- not even when the user listed it in targetNamespaces or
-// ignoreNamespaces.
-func (r *SyncObjectReconciler) getTargetNamespaces(ctx context.Context, syncObject syncv1alpha1.SyncObject) ([]string, []string, error) {
+// The reference's own namespace is never a target: it holds the original,
+// which must not be overwritten by a replica of itself, not even when the
+// user listed that namespace explicitly.
+func (r *SyncObjectReconciler) getTargetNamespaces(ctx context.Context, syncObject syncv1alpha1.SyncObject) ([]string, error) {
 	// cloned: appending to a spec field's slice could otherwise write into
 	// the SyncObject's own backing array.
 	targetNamespaces := slices.Clone(syncObject.Spec.TargetNamespaces)
-	nonTargetNamespaces := slices.Clone(syncObject.Spec.IgnoreNamespaces)
-
-	var allNamespaces corev1.NamespaceList
-
-	if err := r.Client.List(ctx, &allNamespaces); err != nil {
-		return nil, nil, fmt.Errorf("failed listing namespaces: %v", err)
-	}
 
 	// no namespaces defined, sync to all of them
 	if len(targetNamespaces) == 0 {
+		var allNamespaces corev1.NamespaceList
+		if err := r.Client.List(ctx, &allNamespaces); err != nil {
+			return nil, fmt.Errorf("failed listing namespaces: %v", err)
+		}
 		for _, namespace := range allNamespaces.Items {
 			targetNamespaces = append(targetNamespaces, namespace.GetName())
-		}
-	}
-
-	// we only sync to specified namespaces, check which are nonTarget namespaces
-	// so we can delete replicas there if there are some leftovers
-	for _, namespace := range allNamespaces.Items {
-		if !slices.Contains(targetNamespaces, namespace.GetName()) {
-			// namespace is not a target
-			nonTargetNamespaces = append(nonTargetNamespaces, namespace.GetName())
 		}
 	}
 
@@ -398,13 +382,7 @@ func (r *SyncObjectReconciler) getTargetNamespaces(ctx context.Context, syncObje
 		targetNamespaces = remove(targetNamespaces, ignoreNamespace)
 	}
 
-	// the original is not a replica: don't replicate over it, and don't
-	// delete it.
-	referenceNamespace := syncObject.Spec.Reference.Namespace
-	targetNamespaces = remove(targetNamespaces, referenceNamespace)
-	nonTargetNamespaces = remove(nonTargetNamespaces, referenceNamespace)
-
-	return targetNamespaces, nonTargetNamespaces, nil
+	return remove(targetNamespaces, syncObject.Spec.Reference.Namespace), nil
 }
 
 // remove returns a copy of slice with all elements equal to s removed.
@@ -458,53 +436,54 @@ func (r *SyncObjectReconciler) replicate(ctx context.Context, syncObject syncv1a
 	return nil
 }
 
-// TODO: check ownerreference or something before deleting
-func (r *SyncObjectReconciler) deleteReplica(ctx context.Context, ref syncv1alpha1.Reference, namespace string) error {
-	var objectToDelete unstructured.Unstructured
-	objectToDelete.SetName(ref.Name)
-	objectToDelete.SetNamespace(namespace)
-	objectToDelete.SetGroupVersionKind(ref.GroupVersionKind())
-
-	log.Log.Info("deleting", "object", objectToDelete)
-
-	if err := r.Client.Delete(ctx, &objectToDelete); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed deleting replica: %v", err)
+// isReplicaOf reports whether obj is a replica this SyncObject created from
+// ref, going by the marks replicate put on it.
+func isReplicaOf(obj *unstructured.Unstructured, syncObject syncv1alpha1.SyncObject, ref syncv1alpha1.Reference) bool {
+	if obj.GetLabels()[managedByLabel] != managedByValue {
+		return false
 	}
 
-	return nil
+	annotations := obj.GetAnnotations()
+	return annotations[syncObjectAnnotation] == syncObject.Name &&
+		annotations[sourceNamespaceAnnotation] == ref.Namespace &&
+		annotations[sourceNameAnnotation] == ref.Name
 }
 
-// deleteAllReplicas removes ref's replicas from every namespace.
+// deleteReplicas removes the replicas this SyncObject created from ref,
+// apart from those in the keep namespaces. Pass no keep namespaces to
+// remove all of them.
 //
-// ref's own object is never deleted, and neither is any object a protected
-// reference points at: when spec.reference changes, the old and new
-// reference can share a group/version/kind and name while differing only in
-// namespace, in which case cleaning up the old reference would otherwise
-// delete the new original.
-func (r *SyncObjectReconciler) deleteAllReplicas(ctx context.Context, ref syncv1alpha1.Reference, protected ...syncv1alpha1.Reference) error {
-	var namespaces corev1.NamespaceList
+// Replicas are identified by the marks replicate leaves on them rather than
+// by name, so an unrelated object that merely happens to share a name is
+// never touched. Neither is the original, which carries no such marks --
+// this is what makes cleaning up a previous reference safe even when it
+// shares a kind and name with the current one.
+func (r *SyncObjectReconciler) deleteReplicas(ctx context.Context, syncObject syncv1alpha1.SyncObject, ref syncv1alpha1.Reference, keep []string) error {
+	listGVK := ref.GroupVersionKind()
+	listGVK.Kind += "List"
 
-	if err := r.Client.List(ctx, &namespaces); err != nil {
-		return fmt.Errorf("failed listing namespaces: %v", err)
+	var candidates unstructured.UnstructuredList
+	candidates.SetGroupVersionKind(listGVK)
+
+	// the label narrows this down server side; the annotations below then
+	// pin it to this SyncObject and this particular reference.
+	if err := r.Client.List(ctx, &candidates, client.MatchingLabels{managedByLabel: managedByValue}); err != nil {
+		return fmt.Errorf("failed listing replicas: %v", err)
 	}
 
 	var multiErr error
-	for _, namespace := range namespaces.Items {
-		// the object deleteReplica would delete in this namespace
-		candidate := ref
-		candidate.Namespace = namespace.GetName()
-
-		if candidate == ref {
-			// do not delete the original
+	for _, replica := range candidates.Items {
+		if !isReplicaOf(&replica, syncObject, ref) {
 			continue
 		}
-		if slices.Contains(protected, candidate) {
-			// another reference points at this object, it's not a replica
+		if slices.Contains(keep, replica.GetNamespace()) {
 			continue
 		}
 
-		if err := r.deleteReplica(ctx, ref, namespace.GetName()); err != nil {
-			multiErr = errors.Join(multiErr, err)
+		log.Log.Info("deleting replica", "gvk", replica.GroupVersionKind().String(), "namespace", replica.GetNamespace(), "name", replica.GetName())
+
+		if err := r.Client.Delete(ctx, &replica); err != nil && !apierrors.IsNotFound(err) {
+			multiErr = errors.Join(multiErr, fmt.Errorf("failed deleting replica in %q: %v", replica.GetNamespace(), err))
 		}
 	}
 
