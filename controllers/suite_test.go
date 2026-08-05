@@ -263,6 +263,78 @@ func TestControllersIgnoreNamespaces(t *testing.T) {
 	})
 }
 
+// TestControllersReplacesReplicasWhenReferenceChanges covers issue #9:
+// pointing spec.reference at a different object must not leave the previous
+// reference's replicas behind, since they're named after the old reference
+// and nothing would ever touch them again.
+func TestControllersReplacesReplicasWhenReferenceChanges(t *testing.T) {
+	ctx := context.Background()
+
+	originNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "refchange-origin-namespace"},
+	}
+	targetNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "refchange-target-namespace"},
+	}
+	firstOrigin := &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "refchange-first", Namespace: originNamespace.Name},
+		Data:       map[string]string{"which": "first"},
+	}
+	secondOrigin := &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "refchange-second", Namespace: originNamespace.Name},
+		Data:       map[string]string{"which": "second"},
+	}
+
+	require.NoError(t, k8sClient.Create(ctx, originNamespace))
+	require.NoError(t, k8sClient.Create(ctx, targetNamespace))
+	require.NoError(t, k8sClient.Create(ctx, firstOrigin))
+	require.NoError(t, k8sClient.Create(ctx, secondOrigin))
+
+	syncObject := &syncv1alpha1.SyncObject{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sync-refchange"},
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "",
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Name:      firstOrigin.Name,
+				Namespace: originNamespace.Name,
+			},
+			TargetNamespaces: []string{targetNamespace.Name},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, syncObject))
+
+	firstReplica := client.ObjectKey{Namespace: targetNamespace.Name, Name: firstOrigin.Name}
+	secondReplica := client.ObjectKey{Namespace: targetNamespace.Name, Name: secondOrigin.Name}
+
+	require.Eventually(t, func() bool {
+		return k8sClient.Get(ctx, firstReplica, &corev1.ConfigMap{}) == nil
+	}, timeout, interval, "the first reference should have been replicated")
+
+	// repoint the SyncObject at the other ConfigMap
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(syncObject), syncObject))
+	syncObject.Spec.Reference.Name = secondOrigin.Name
+	require.NoError(t, k8sClient.Update(ctx, syncObject))
+
+	require.Eventually(t, func() bool {
+		return k8sClient.Get(ctx, secondReplica, &corev1.ConfigMap{}) == nil
+	}, timeout, interval, "the new reference should have been replicated")
+
+	require.Eventually(t, func() bool {
+		return apierrors.IsNotFound(k8sClient.Get(ctx, firstReplica, &corev1.ConfigMap{}))
+	}, timeout, interval, "the previous reference's replica should have been cleaned up, not orphaned")
+
+	// neither original may be touched by the cleanup
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(firstOrigin), &corev1.ConfigMap{}))
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(secondOrigin), &corev1.ConfigMap{}))
+}
+
 // TestControllersSyncsOnReferenceChange proves the dynamic reference watch
 // works: the SyncObject below is deliberately left at its default 1h
 // resync interval, so if the replica picks up a change to the *origin*

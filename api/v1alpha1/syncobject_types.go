@@ -2,6 +2,7 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -37,10 +38,22 @@ type Reference struct {
 	Namespace string `json:"namespace"`
 }
 
+// GroupVersionKind returns the GroupVersionKind the reference points at.
+func (r Reference) GroupVersionKind() schema.GroupVersionKind {
+	return schema.GroupVersionKind{Group: r.Group, Version: r.Version, Kind: r.Kind}
+}
+
 // SyncObjectStatus defines the observed state of SyncObject
 type SyncObjectStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
+
+	// AppliedReference is the reference whose replicas were last created.
+	// It's what lets a change to spec.reference clean up the replicas of
+	// the previous reference, which are named after it and would otherwise
+	// be orphaned.
+	// +optional
+	AppliedReference *Reference `json:"appliedReference,omitempty"`
 }
 
 //+kubebuilder:object:root=true

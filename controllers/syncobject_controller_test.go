@@ -108,6 +108,65 @@ func TestIndexByReference(t *testing.T) {
 	require.Nil(t, indexByReference(&corev1.ConfigMap{}))
 }
 
+func TestReferencesToCleanUp(t *testing.T) {
+	current := syncv1alpha1.Reference{Group: "", Version: "v1", Kind: "ConfigMap", Name: "current", Namespace: "ns"}
+	previous := syncv1alpha1.Reference{Group: "", Version: "v1", Kind: "ConfigMap", Name: "previous", Namespace: "ns"}
+
+	tests := []struct {
+		name    string
+		applied *syncv1alpha1.Reference
+		want    []syncv1alpha1.Reference
+	}{
+		{"nothing applied yet", nil, []syncv1alpha1.Reference{current}},
+		{"applied matches spec", &current, []syncv1alpha1.Reference{current}},
+		{"reference changed", &previous, []syncv1alpha1.Reference{current, previous}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			syncObject := syncv1alpha1.SyncObject{
+				Spec:   syncv1alpha1.SyncObjectSpec{Reference: current},
+				Status: syncv1alpha1.SyncObjectStatus{AppliedReference: tt.applied},
+			}
+			require.Equal(t, tt.want, referencesToCleanUp(syncObject))
+		})
+	}
+}
+
+// TestDeleteAllReplicasProtectsReferencedObjects covers the nastiest case of
+// a changed reference: the old and new reference share a kind and name and
+// differ only in namespace, so a naive cleanup of the old reference's
+// replicas would delete the new reference's original object.
+func TestDeleteAllReplicasProtectsReferencedObjects(t *testing.T) {
+	oldRef := syncv1alpha1.Reference{Group: "", Version: "v1", Kind: "ConfigMap", Name: "shared-name", Namespace: "old-ns"}
+	newRef := syncv1alpha1.Reference{Group: "", Version: "v1", Kind: "ConfigMap", Name: "shared-name", Namespace: "new-ns"}
+
+	fakeClient := fake.NewClientBuilder().
+		WithObjects(
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "old-ns"}},
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "new-ns"}},
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "replica-ns"}},
+			// the two originals plus one actual replica
+			&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "shared-name", Namespace: "old-ns"}},
+			&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "shared-name", Namespace: "new-ns"}},
+			&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "shared-name", Namespace: "replica-ns"}},
+		).
+		Build()
+
+	r := &SyncObjectReconciler{Client: fakeClient}
+
+	require.NoError(t, r.deleteAllReplicas(context.Background(), oldRef, newRef))
+
+	exists := func(namespace string) bool {
+		err := fakeClient.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: "shared-name"}, &corev1.ConfigMap{})
+		return err == nil
+	}
+
+	require.True(t, exists("old-ns"), "the old reference's own object must never be deleted")
+	require.True(t, exists("new-ns"), "the new reference's original must not be deleted as if it were a replica")
+	require.False(t, exists("replica-ns"), "an actual replica of the old reference should be deleted")
+}
+
 func TestDeleteAllReplicasPropagatesErrors(t *testing.T) {
 	referenceNamespace := "reference-ns"
 	failingNamespace := "failing-ns"
@@ -142,19 +201,15 @@ func TestDeleteAllReplicasPropagatesErrors(t *testing.T) {
 
 	r := &SyncObjectReconciler{Client: fakeClient}
 
-	syncObject := syncv1alpha1.SyncObject{
-		Spec: syncv1alpha1.SyncObjectSpec{
-			Reference: syncv1alpha1.Reference{
-				Group:     "",
-				Version:   "v1",
-				Kind:      "ConfigMap",
-				Name:      "cm",
-				Namespace: referenceNamespace,
-			},
-		},
+	ref := syncv1alpha1.Reference{
+		Group:     "",
+		Version:   "v1",
+		Kind:      "ConfigMap",
+		Name:      "cm",
+		Namespace: referenceNamespace,
 	}
 
-	err := r.deleteAllReplicas(context.Background(), syncObject)
+	err := r.deleteAllReplicas(context.Background(), ref)
 	require.Error(t, err, "an error from a single namespace must not be swallowed")
 	require.ErrorContains(t, err, wantErr.Error())
 	require.True(t, deletedOK, "deletion in the non-failing namespace should still have been attempted")
@@ -173,19 +228,15 @@ func TestDeleteReplicaIgnoresNotFound(t *testing.T) {
 
 	r := &SyncObjectReconciler{Client: fakeClient}
 
-	syncObject := syncv1alpha1.SyncObject{
-		Spec: syncv1alpha1.SyncObjectSpec{
-			Reference: syncv1alpha1.Reference{
-				Group:     "",
-				Version:   "v1",
-				Kind:      "ConfigMap",
-				Name:      "does-not-exist",
-				Namespace: referenceNamespace,
-			},
-		},
+	ref := syncv1alpha1.Reference{
+		Group:     "",
+		Version:   "v1",
+		Kind:      "ConfigMap",
+		Name:      "does-not-exist",
+		Namespace: referenceNamespace,
 	}
 
 	// deleting a replica that was never created (e.g. a namespace that was
 	// never a sync target) must not be reported as an error.
-	require.NoError(t, r.deleteReplica(context.Background(), syncObject, emptyNamespace))
+	require.NoError(t, r.deleteReplica(context.Background(), ref, emptyNamespace))
 }

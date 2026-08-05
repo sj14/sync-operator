@@ -88,6 +88,31 @@ spec:
             type: object
           status:
             description: SyncObjectStatus defines the observed state of SyncObject
+            properties:
+              appliedReference:
+                description: |-
+                  AppliedReference is the reference whose replicas were last created.
+                  It's what lets a change to spec.reference clean up the replicas of
+                  the previous reference, which are named after it and would otherwise
+                  be orphaned.
+                properties:
+                  group:
+                    type: string
+                  kind:
+                    type: string
+                  name:
+                    type: string
+                  namespace:
+                    type: string
+                  version:
+                    type: string
+                required:
+                - group
+                - kind
+                - name
+                - namespace
+                - version
+                type: object
             type: object
         type: object
     served: true

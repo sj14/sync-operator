@@ -85,6 +85,16 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
+	// spec.reference was changed to point somewhere else: the replicas of the
+	// previous reference are named after it, so nothing below would ever touch
+	// them again and they'd be orphaned.
+	if applied := syncObject.Status.AppliedReference; applied != nil && *applied != syncObject.Spec.Reference {
+		logger.Info("reference changed, removing replicas of the previous reference", "previous", *applied, "current", syncObject.Spec.Reference)
+		if err := r.deleteAllReplicas(ctx, *applied, syncObject.Spec.Reference); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed removing replicas of the previous reference: %v", err)
+		}
+	}
+
 	targetNamespaces, nonTargetNamespaces, err := r.getTargetNamespaces(ctx, syncObject)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed getting target namespaces: %v", err)
@@ -93,19 +103,26 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	var multiErr error
 	// cleanup leftovers, e.g. when the targetNamespaces changed
 	for _, namespace := range nonTargetNamespaces {
-		if err := r.deleteReplica(ctx, syncObject, namespace); err != nil {
+		if err := r.deleteReplica(ctx, syncObject.Spec.Reference, namespace); err != nil {
 			multiErr = errors.Join(multiErr, fmt.Errorf("failed cleaning up replica: %v", err))
 		}
 	}
 
 	for _, namespace := range targetNamespaces {
-		if err := r.replicate(ctx, syncObject, namespace); err != nil {
+		if err := r.replicate(ctx, syncObject.Spec.Reference, namespace); err != nil {
 			multiErr = errors.Join(multiErr, fmt.Errorf("failed creating replica: %v", err))
 		}
 	}
 
 	if multiErr != nil {
 		return ctrl.Result{}, multiErr
+	}
+
+	// Only recorded once the replicas above actually exist. If replication
+	// failed we keep the previous value, so the next attempt still knows
+	// which replicas to clean up.
+	if err := r.setAppliedReference(ctx, &syncObject); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// when there was no error, requeue after the resync interval as a
@@ -141,11 +158,21 @@ func (r *SyncObjectReconciler) handleFinalizer(ctx context.Context, syncObject *
 	// The object is being deleted
 	if controllerutil.ContainsFinalizer(syncObject, finalizerName) {
 		if !syncObject.Spec.DisableFinalizer {
-			// our finalizer is present, so lets handle any external dependency
-			if err := r.deleteAllReplicas(ctx, *syncObject); err != nil {
+			// our finalizer is present, so lets handle any external dependency.
+			// A reference change that was never reconciled leaves replicas of
+			// the previous reference behind too, so clean up both.
+			refs := referencesToCleanUp(*syncObject)
+
+			var multiErr error
+			for _, ref := range refs {
+				if err := r.deleteAllReplicas(ctx, ref, refs...); err != nil {
+					multiErr = errors.Join(multiErr, err)
+				}
+			}
+			if multiErr != nil {
 				// if fail to delete the external dependency here, return with error
 				// so that it can be retried
-				return true, err
+				return true, multiErr
 			}
 		}
 
@@ -311,15 +338,11 @@ func remove(slice []string, s string) []string {
 }
 
 // TODO: Add finalizer, ownerreference/managedby?
-func (r *SyncObjectReconciler) replicate(ctx context.Context, syncObject syncv1alpha1.SyncObject, namespace string) error {
+func (r *SyncObjectReconciler) replicate(ctx context.Context, ref syncv1alpha1.Reference, namespace string) error {
 	var original unstructured.Unstructured
-	original.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   syncObject.Spec.Reference.Group,
-		Version: syncObject.Spec.Reference.Version,
-		Kind:    syncObject.Spec.Reference.Kind,
-	})
+	original.SetGroupVersionKind(ref.GroupVersionKind())
 
-	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: syncObject.Spec.Reference.Namespace, Name: syncObject.Spec.Reference.Name}, &original); err != nil {
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, &original); err != nil {
 		return fmt.Errorf("failed getting original object: %v", err)
 	}
 
@@ -353,15 +376,11 @@ func (r *SyncObjectReconciler) replicate(ctx context.Context, syncObject syncv1a
 }
 
 // TODO: check ownerreference or something before deleting
-func (r *SyncObjectReconciler) deleteReplica(ctx context.Context, syncObject syncv1alpha1.SyncObject, namespace string) error {
+func (r *SyncObjectReconciler) deleteReplica(ctx context.Context, ref syncv1alpha1.Reference, namespace string) error {
 	var objectToDelete unstructured.Unstructured
-	objectToDelete.SetName(syncObject.Spec.Reference.Name)
+	objectToDelete.SetName(ref.Name)
 	objectToDelete.SetNamespace(namespace)
-	objectToDelete.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   syncObject.Spec.Reference.Group,
-		Version: syncObject.Spec.Reference.Version,
-		Kind:    syncObject.Spec.Reference.Kind,
-	})
+	objectToDelete.SetGroupVersionKind(ref.GroupVersionKind())
 
 	log.Log.Info("deleting", "object", objectToDelete)
 
@@ -372,7 +391,14 @@ func (r *SyncObjectReconciler) deleteReplica(ctx context.Context, syncObject syn
 	return nil
 }
 
-func (r *SyncObjectReconciler) deleteAllReplicas(ctx context.Context, syncObject syncv1alpha1.SyncObject) error {
+// deleteAllReplicas removes ref's replicas from every namespace.
+//
+// ref's own object is never deleted, and neither is any object a protected
+// reference points at: when spec.reference changes, the old and new
+// reference can share a group/version/kind and name while differing only in
+// namespace, in which case cleaning up the old reference would otherwise
+// delete the new original.
+func (r *SyncObjectReconciler) deleteAllReplicas(ctx context.Context, ref syncv1alpha1.Reference, protected ...syncv1alpha1.Reference) error {
 	var namespaces corev1.NamespaceList
 
 	if err := r.Client.List(ctx, &namespaces); err != nil {
@@ -381,15 +407,50 @@ func (r *SyncObjectReconciler) deleteAllReplicas(ctx context.Context, syncObject
 
 	var multiErr error
 	for _, namespace := range namespaces.Items {
-		if namespace.GetName() == syncObject.Spec.Reference.Namespace {
+		// the object deleteReplica would delete in this namespace
+		candidate := ref
+		candidate.Namespace = namespace.GetName()
+
+		if candidate == ref {
 			// do not delete the original
 			continue
 		}
+		if slices.Contains(protected, candidate) {
+			// another reference points at this object, it's not a replica
+			continue
+		}
 
-		if err := r.deleteReplica(ctx, syncObject, namespace.GetName()); err != nil {
+		if err := r.deleteReplica(ctx, ref, namespace.GetName()); err != nil {
 			multiErr = errors.Join(multiErr, err)
 		}
 	}
 
 	return multiErr
+}
+
+// referencesToCleanUp returns every reference whose replicas belong to this
+// SyncObject: the current one, plus the previously applied one when
+// spec.reference has changed and its replicas haven't been cleaned up yet.
+func referencesToCleanUp(syncObject syncv1alpha1.SyncObject) []syncv1alpha1.Reference {
+	refs := []syncv1alpha1.Reference{syncObject.Spec.Reference}
+	if applied := syncObject.Status.AppliedReference; applied != nil && *applied != syncObject.Spec.Reference {
+		refs = append(refs, *applied)
+	}
+	return refs
+}
+
+// setAppliedReference records the reference we just replicated, so a later
+// change to spec.reference can find and clean up these replicas.
+func (r *SyncObjectReconciler) setAppliedReference(ctx context.Context, syncObject *syncv1alpha1.SyncObject) error {
+	if applied := syncObject.Status.AppliedReference; applied != nil && *applied == syncObject.Spec.Reference {
+		return nil
+	}
+
+	ref := syncObject.Spec.Reference
+	syncObject.Status.AppliedReference = &ref
+	if err := r.Status().Update(ctx, syncObject); err != nil {
+		return fmt.Errorf("failed recording applied reference: %v", err)
+	}
+
+	return nil
 }
