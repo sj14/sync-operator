@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	syncv1alpha1 "github.com/sj14/sync-operator/api/v1alpha1"
-	"golang.org/x/exp/slices"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -174,15 +174,13 @@ func (r *SyncObjectReconciler) getTargetNamespaces(ctx context.Context, syncObje
 	return targetNamespaces, nonTargetNamespaces, nil
 }
 
+// remove returns a copy of slice with all elements equal to s removed.
+// The input slice is left untouched: slices.DeleteFunc mutates in place, and
+// slice here may alias a SyncObject's own spec field.
 func remove(slice []string, s string) []string {
-	var result []string
-	for idx := range slice {
-		if slice[idx] == s {
-			continue
-		}
-		result = append(slice[:idx], slice[idx+1:]...)
-	}
-	return result
+	return slices.DeleteFunc(slices.Clone(slice), func(v string) bool {
+		return v == s
+	})
 }
 
 // TODO: Add finalizer, ownerreference/managedby?
@@ -240,7 +238,7 @@ func (r *SyncObjectReconciler) deleteReplica(ctx context.Context, syncObject syn
 
 	log.Log.Info("deleting", "object", objectToDelete)
 
-	if err := r.Client.Delete(ctx, &objectToDelete); err != nil {
+	if err := r.Client.Delete(ctx, &objectToDelete); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed deleting replica: %v", err)
 	}
 
@@ -254,18 +252,17 @@ func (r *SyncObjectReconciler) deleteAllReplicas(ctx context.Context, syncObject
 		return fmt.Errorf("failed listing namespaces: %v", err)
 	}
 
-	var err error
+	var multiErr error
 	for _, namespace := range namespaces.Items {
 		if namespace.GetName() == syncObject.Spec.Reference.Namespace {
 			// do not delete the original
 			continue
 		}
 
-		// log.Log.Info("going to delete", "object", objectToDelete, "ns", namespace.GetName())
 		if err := r.deleteReplica(ctx, syncObject, namespace.GetName()); err != nil {
-			errors.Join(err)
+			multiErr = errors.Join(multiErr, err)
 		}
 	}
 
-	return err
+	return multiErr
 }

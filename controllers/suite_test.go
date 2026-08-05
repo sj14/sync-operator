@@ -186,6 +186,82 @@ func TestControllersCreateDelete(t *testing.T) {
 	})
 }
 
+func TestControllersIgnoreNamespaces(t *testing.T) {
+	ctx := context.Background()
+
+	originNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ignoretest-origin-namespace"},
+	}
+	targetNamespaceA := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ignoretest-target-a"},
+	}
+	targetNamespaceB := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ignoretest-target-b"},
+	}
+	ignoredNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ignoretest-ignore-c"},
+	}
+
+	configMapPayload := map[string]string{"key": "value"}
+	originConfigMap := &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "ignoretest-origin-configmap", Namespace: originNamespace.Name},
+		Data:       configMapPayload,
+	}
+
+	require.NoError(t, k8sClient.Create(ctx, originNamespace))
+	require.NoError(t, k8sClient.Create(ctx, targetNamespaceA))
+	require.NoError(t, k8sClient.Create(ctx, targetNamespaceB))
+	require.NoError(t, k8sClient.Create(ctx, ignoredNamespace))
+	require.NoError(t, k8sClient.Create(ctx, originConfigMap))
+
+	syncObject := &syncv1alpha1.SyncObject{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sync-ignoretest"},
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:   "",
+				Version: "v1",
+				// originConfigMap.Kind is empty by this point: Create() clears
+				// TypeMeta on the object it was called with, so we use the
+				// literal Kind instead (see getOriginConfigMap's doc comment
+				// for the same gotcha).
+				Kind:      "ConfigMap",
+				Name:      originConfigMap.Name,
+				Namespace: originConfigMap.Namespace,
+			},
+			TargetNamespaces: []string{targetNamespaceA.Name, targetNamespaceB.Name, ignoredNamespace.Name},
+			IgnoreNamespaces: []string{ignoredNamespace.Name},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, syncObject))
+
+	t.Run("replica is created in target namespaces", func(t *testing.T) {
+		for _, ns := range []string{targetNamespaceA.Name, targetNamespaceB.Name} {
+			replica := &corev1.ConfigMap{}
+			key := client.ObjectKey{Namespace: ns, Name: originConfigMap.Name}
+			require.Eventually(t, func() bool {
+				if err := k8sClient.Get(ctx, key, replica); err != nil {
+					return false
+				}
+				return true
+			}, timeout, interval)
+			require.Equal(t, configMapPayload, replica.Data)
+		}
+	})
+
+	t.Run("replica is not created in an ignored namespace", func(t *testing.T) {
+		replica := &corev1.ConfigMap{}
+		key := client.ObjectKey{Namespace: ignoredNamespace.Name, Name: originConfigMap.Name}
+		err := k8sClient.Get(ctx, key, replica)
+		require.True(t, apierrors.IsNotFound(err), "expected no replica in an ignored namespace, got: %v", err)
+	})
+}
+
 // helper as gvk would be missing after creation
 func getOriginNamespace() *corev1.Namespace {
 	return &corev1.Namespace{
