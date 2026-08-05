@@ -45,6 +45,51 @@ type SyncObjectReconciler struct {
 
 const finalizerName = "sync.sj14.github.io/finalizer"
 
+const (
+	// managedByLabel marks an object as a replica created by this operator.
+	//
+	// It's a label rather than an annotation so it can be selected on, by
+	// kubectl or by the objectSelector of a ValidatingAdmissionPolicyBinding.
+	//
+	// Deliberately not app.kubernetes.io/managed-by: the referenced object
+	// may already carry that (set by Helm, say), and overwriting it on the
+	// replica would both lose that information and misreport the replica to
+	// whatever tool set it.
+	managedByLabel = "sync.sj14.github.io/managed-by"
+	managedByValue = "sync-operator"
+
+	// Provenance of a replica, for anyone wondering where it came from.
+	syncObjectAnnotation      = "sync.sj14.github.io/sync-object"
+	sourceNamespaceAnnotation = "sync.sj14.github.io/source-namespace"
+	sourceNameAnnotation      = "sync.sj14.github.io/source-name"
+)
+
+// markAsReplica records that this object is a replica, and which SyncObject
+// and source object it came from. Existing labels and annotations copied
+// from the original are kept.
+//
+// Everything written here is derived from the SyncObject, never from the
+// current time or the cluster's state: the values have to come out
+// identical on every reconcile, otherwise each pass would be a real write,
+// which would wake the watch, which would reconcile again.
+func markAsReplica(replica *unstructured.Unstructured, syncObject syncv1alpha1.SyncObject) {
+	labels := replica.GetLabels()
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	labels[managedByLabel] = managedByValue
+	replica.SetLabels(labels)
+
+	annotations := replica.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[syncObjectAnnotation] = syncObject.Name
+	annotations[sourceNamespaceAnnotation] = syncObject.Spec.Reference.Namespace
+	annotations[sourceNameAnnotation] = syncObject.Spec.Reference.Name
+	replica.SetAnnotations(annotations)
+}
+
 // defaultResyncInterval is used when SyncObjectSpec.ResyncInterval is not set.
 const defaultResyncInterval = 1 * time.Hour
 
@@ -109,7 +154,7 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	for _, namespace := range targetNamespaces {
-		if err := r.replicate(ctx, syncObject.Spec.Reference, namespace); err != nil {
+		if err := r.replicate(ctx, syncObject, namespace); err != nil {
 			multiErr = errors.Join(multiErr, fmt.Errorf("failed creating replica: %v", err))
 		}
 	}
@@ -371,8 +416,10 @@ func remove(slice []string, s string) []string {
 	})
 }
 
-// TODO: Add finalizer, ownerreference/managedby?
-func (r *SyncObjectReconciler) replicate(ctx context.Context, ref syncv1alpha1.Reference, namespace string) error {
+// TODO: Add finalizer, ownerreference?
+func (r *SyncObjectReconciler) replicate(ctx context.Context, syncObject syncv1alpha1.SyncObject, namespace string) error {
+	ref := syncObject.Spec.Reference
+
 	var original unstructured.Unstructured
 	original.SetGroupVersionKind(ref.GroupVersionKind())
 
@@ -387,6 +434,8 @@ func (r *SyncObjectReconciler) replicate(ctx context.Context, ref syncv1alpha1.R
 	replica.SetResourceVersion("")
 	replica.SetUID(types.UID(""))
 	// TODO: add more?
+
+	markAsReplica(replica, syncObject)
 
 	log.Log.Info("creating/updating", "gvk", replica.GroupVersionKind().String(), "namespace", replica.GetNamespace(), "name", replica.GetName())
 

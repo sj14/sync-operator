@@ -64,3 +64,20 @@ spec:
 ```
 
 After applying the manifests, the `ConfigMap` should get synced across the namespaces.
+
+## Replicas
+
+Replicas keep the labels and annotations of the resource they were copied from, and get these added on top:
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `sync.sj14.github.io/managed-by` | label | Always `sync-operator`. Marks the object as a replica. |
+| `sync.sj14.github.io/sync-object` | annotation | Name of the `SyncObject` that created it. |
+| `sync.sj14.github.io/source-namespace` | annotation | Namespace of the resource it was copied from. |
+| `sync.sj14.github.io/source-name` | annotation | Name of the resource it was copied from. |
+
+The reference itself is never marked, only its replicas. So to list every replica in the cluster:
+
+```console
+kubectl get configmaps -A -l sync.sj14.github.io/managed-by=sync-operator
+```

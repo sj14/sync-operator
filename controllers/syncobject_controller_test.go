@@ -203,6 +203,69 @@ func TestGetTargetNamespaces(t *testing.T) {
 	}
 }
 
+func TestMarkAsReplica(t *testing.T) {
+	syncObject := syncv1alpha1.SyncObject{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-syncobject"},
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "",
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Name:      "source-cm",
+				Namespace: "source-ns",
+			},
+		},
+	}
+
+	newReplica := func() *unstructured.Unstructured {
+		replica := &unstructured.Unstructured{}
+		replica.SetGroupVersionKind(syncObject.Spec.Reference.GroupVersionKind())
+		replica.SetName("source-cm")
+		replica.SetNamespace("target-ns")
+		return replica
+	}
+
+	t.Run("marks the replica", func(t *testing.T) {
+		replica := newReplica()
+		markAsReplica(replica, syncObject)
+
+		require.Equal(t, managedByValue, replica.GetLabels()[managedByLabel])
+		require.Equal(t, map[string]string{
+			syncObjectAnnotation:      "my-syncobject",
+			sourceNamespaceAnnotation: "source-ns",
+			sourceNameAnnotation:      "source-cm",
+		}, replica.GetAnnotations())
+	})
+
+	t.Run("keeps labels and annotations copied from the original", func(t *testing.T) {
+		replica := newReplica()
+		replica.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "Helm", "team": "platform"})
+		replica.SetAnnotations(map[string]string{"example.com/note": "keep me"})
+
+		markAsReplica(replica, syncObject)
+
+		labels := replica.GetLabels()
+		require.Equal(t, managedByValue, labels[managedByLabel])
+		require.Equal(t, "platform", labels["team"])
+		require.Equal(t, "Helm", labels["app.kubernetes.io/managed-by"],
+			"the original's own managed-by must not be hijacked")
+		require.Equal(t, "keep me", replica.GetAnnotations()["example.com/note"])
+	})
+
+	// Anything time- or state-dependent in here would make every reconcile a
+	// real write, which would wake the watch and reconcile again, forever.
+	t.Run("is deterministic", func(t *testing.T) {
+		first := newReplica()
+		markAsReplica(first, syncObject)
+
+		second := newReplica()
+		markAsReplica(second, syncObject)
+		markAsReplica(second, syncObject)
+
+		require.Equal(t, first.Object, second.Object, "marking must be repeatable and idempotent")
+	})
+}
+
 func TestReferencesToCleanUp(t *testing.T) {
 	current := syncv1alpha1.Reference{Group: "", Version: "v1", Kind: "ConfigMap", Name: "current", Namespace: "ns"}
 	previous := syncv1alpha1.Reference{Group: "", Version: "v1", Kind: "ConfigMap", Name: "previous", Namespace: "ns"}

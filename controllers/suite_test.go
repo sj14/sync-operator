@@ -263,6 +263,87 @@ func TestControllersIgnoreNamespaces(t *testing.T) {
 	})
 }
 
+// TestControllersMarksReplicas checks that replicas are identifiable as
+// such in the cluster, which is what a ValidatingAdmissionPolicy would need
+// to select them, and that the original is left alone.
+func TestControllersMarksReplicas(t *testing.T) {
+	ctx := context.Background()
+
+	originNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "marks-origin-namespace"},
+	}
+	targetNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "marks-target-namespace"},
+	}
+	originConfigMap := &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "marks-configmap",
+			Namespace:   originNamespace.Name,
+			Labels:      map[string]string{"team": "platform"},
+			Annotations: map[string]string{"example.com/note": "keep me"},
+		},
+		Data: map[string]string{"key": "value"},
+	}
+
+	require.NoError(t, k8sClient.Create(ctx, originNamespace))
+	require.NoError(t, k8sClient.Create(ctx, targetNamespace))
+	require.NoError(t, k8sClient.Create(ctx, originConfigMap))
+
+	syncObject := &syncv1alpha1.SyncObject{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sync-marks"},
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "",
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Name:      originConfigMap.Name,
+				Namespace: originNamespace.Name,
+			},
+			TargetNamespaces: []string{targetNamespace.Name},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, syncObject))
+
+	replicaKey := client.ObjectKey{Namespace: targetNamespace.Name, Name: originConfigMap.Name}
+	replica := &corev1.ConfigMap{}
+	require.Eventually(t, func() bool {
+		return k8sClient.Get(ctx, replicaKey, replica) == nil
+	}, timeout, interval)
+
+	require.Equal(t, managedByValue, replica.Labels[managedByLabel])
+	require.Equal(t, "platform", replica.Labels["team"], "labels from the original should survive")
+	require.Equal(t, syncObject.Name, replica.Annotations[syncObjectAnnotation])
+	require.Equal(t, originNamespace.Name, replica.Annotations[sourceNamespaceAnnotation])
+	require.Equal(t, originConfigMap.Name, replica.Annotations[sourceNameAnnotation])
+	require.Equal(t, "keep me", replica.Annotations["example.com/note"], "annotations from the original should survive")
+
+	// the original is not a replica and must not be marked as one
+	original := &corev1.ConfigMap{}
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(originConfigMap), original))
+	require.NotContains(t, original.Labels, managedByLabel)
+	require.NotContains(t, original.Annotations, syncObjectAnnotation)
+
+	// the label has to actually be selectable, that's the point of it.
+	// Note other SyncObjects in this suite replicate into every namespace,
+	// so the selector legitimately returns their replicas too -- only this
+	// test's own objects can be asserted on.
+	var selected corev1.ConfigMapList
+	require.NoError(t, k8sClient.List(ctx, &selected, client.MatchingLabels{managedByLabel: managedByValue}))
+	var found bool
+	for _, item := range selected.Items {
+		if item.Namespace == replicaKey.Namespace && item.Name == replicaKey.Name {
+			found = true
+		}
+		require.False(t, item.Namespace == originNamespace.Name && item.Name == originConfigMap.Name,
+			"the original must never match the replica selector")
+	}
+	require.True(t, found, "the replica should be findable by the managed-by label")
+}
+
 // TestControllersRepairsReplicaDrift covers a replica being tampered with
 // directly. The SyncObject keeps its default 1h resync interval, so a
 // repair inside the short Eventually window can only come from the watch
