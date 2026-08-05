@@ -48,10 +48,6 @@ spec:
                 items:
                   type: string
                 type: array
-              interval:
-                default: 1h
-                description: Interval for syncing the reference resource.
-                type: string
               reference:
                 properties:
                   group:
@@ -71,6 +67,16 @@ spec:
                 - namespace
                 - version
                 type: object
+              resyncInterval:
+                default: 1h
+                description: |-
+                  ResyncInterval is how often the reference resource is re-checked and
+                  re-applied even without a detected change. Changes to the reference
+                  resource itself are synced immediately via a watch; this interval only
+                  matters as a drift-correction fallback (e.g. a replica was edited
+                  directly, a new target namespace appeared, or the watch could not yet
+                  be established).
+                type: string
               targetNamespaces:
                 description: If no target namespaces are defined, all namespaces will
                   be used.

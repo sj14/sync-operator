@@ -5,7 +5,8 @@ A operator for syncing any kind of resources across namespaces.
 ## Description
 
 Most operators for syncing between namespaces only allow this for configmaps and secrets (which might also be most of the use-cases), but they won't be able to sync any other resources. So, I got curious about the limitations and started to build `sync-operator` which can sync all kind of resources.
-The downside is, that I didn't yet find an easy way for triggering a reconcile when the original resource or one of its replicas get adjusted. Probably, this might be the reason why similar solutions only sync on configmaps ans secrests. As a workaround, you have to set the `interval` in the `SyncObject` to match your needs.
+
+Since the reference resource can be of any kind, `sync-operator` dynamically starts watching whatever kind is referenced (the first time it sees a `SyncObject` pointing at it) and syncs immediately when that resource changes. `resyncInterval` exists as a fallback for what the watch doesn't cover: a replica edited or deleted directly, a new target namespace appearing, or the watch not being established yet (e.g. the referenced kind's CRD wasn't installed at the time). It defaults to `1h`.
 
 ## Deploy
 
@@ -41,7 +42,7 @@ kind: SyncObject
 metadata:
   name: syncobject-sample
 spec:
-  # interval: 1h            # How often to sync the reference resource (defaults to 10h)
+  # resyncInterval: 1h      # Fallback drift-correction interval, on top of the real-time watch (defaults to 1h)
   # targetNamespaces:       # Namespaces to replicate the reference into (defaults to all namespaces)
   #   - kube-public
   # ignoreNamespaces:       # Namespaces to not replicate into

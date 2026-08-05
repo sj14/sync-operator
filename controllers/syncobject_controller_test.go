@@ -50,13 +50,13 @@ func TestRemove(t *testing.T) {
 	}
 }
 
-func TestSyncInterval(t *testing.T) {
+func TestResyncInterval(t *testing.T) {
 	tests := []struct {
 		name     string
 		interval time.Duration
 		want     time.Duration
 	}{
-		{"unset falls back to default", 0, defaultInterval},
+		{"unset falls back to default", 0, defaultResyncInterval},
 		{"explicit value is preserved", 30 * time.Minute, 30 * time.Minute},
 	}
 
@@ -64,12 +64,48 @@ func TestSyncInterval(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			syncObject := syncv1alpha1.SyncObject{
 				Spec: syncv1alpha1.SyncObjectSpec{
-					Interval: metav1.Duration{Duration: tt.interval},
+					ResyncInterval: metav1.Duration{Duration: tt.interval},
 				},
 			}
-			require.Equal(t, tt.want, syncInterval(syncObject))
+			require.Equal(t, tt.want, resyncInterval(syncObject))
 		})
 	}
+}
+
+func TestReferenceKey(t *testing.T) {
+	base := referenceKey("group", "v1", "Kind", "ns", "name")
+	require.Equal(t, base, referenceKey("group", "v1", "Kind", "ns", "name"), "same fields must produce the same key")
+
+	variants := []string{
+		referenceKey("other", "v1", "Kind", "ns", "name"),
+		referenceKey("group", "v2", "Kind", "ns", "name"),
+		referenceKey("group", "v1", "Other", "ns", "name"),
+		referenceKey("group", "v1", "Kind", "other-ns", "name"),
+		referenceKey("group", "v1", "Kind", "ns", "other-name"),
+	}
+	for _, v := range variants {
+		require.NotEqual(t, base, v, "changing a single field must change the key")
+	}
+}
+
+func TestIndexByReference(t *testing.T) {
+	syncObject := &syncv1alpha1.SyncObject{
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "apps",
+				Version:   "v1",
+				Kind:      "Deployment",
+				Name:      "my-deploy",
+				Namespace: "my-ns",
+			},
+		},
+	}
+	want := []string{referenceKey("apps", "v1", "Deployment", "my-ns", "my-deploy")}
+	require.Equal(t, want, indexByReference(syncObject))
+
+	// indexByReference is registered against the SyncObject type; anything
+	// else should be ignored rather than panic.
+	require.Nil(t, indexByReference(&corev1.ConfigMap{}))
 }
 
 func TestDeleteAllReplicasPropagatesErrors(t *testing.T) {

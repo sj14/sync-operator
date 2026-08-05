@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
+	"sync"
 	"time"
 
 	syncv1alpha1 "github.com/sj14/sync-operator/api/v1alpha1"
@@ -15,21 +17,36 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 // SyncObjectReconciler reconciles a SyncObject object
 type SyncObjectReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// cache and dynamicController are used to lazily start a watch on a
+	// Reference's GroupVersionKind the first time it's seen, so changes to
+	// the referenced object trigger an immediate reconcile instead of only
+	// being picked up on the next periodic resync.
+	cache             cache.Cache
+	dynamicController controller.Controller
+
+	watchedGVKsMu sync.Mutex
+	watchedGVKs   map[schema.GroupVersionKind]struct{}
 }
 
 const finalizerName = "sync.sj14.github.io/finalizer"
 
-// defaultInterval is used when SyncObjectSpec.Interval is not set.
-const defaultInterval = 1 * time.Hour
+// defaultResyncInterval is used when SyncObjectSpec.ResyncInterval is not set.
+const defaultResyncInterval = 1 * time.Hour
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -49,6 +66,15 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed getting SyncObject: %v", err)
+	}
+
+	if ref := syncObject.Spec.Reference; ref.Kind != "" {
+		if err := r.ensureReferenceWatch(ctx, ref); err != nil {
+			// Not fatal: resyncInterval's periodic resync still covers us, and
+			// the next Reconcile call (e.g. once the kind's CRD is installed)
+			// retries.
+			logger.Error(err, "failed to watch referenced resource for changes; falling back to periodic resync", "reference", ref)
+		}
 	}
 
 	stop, err := r.handleFinalizer(ctx, &syncObject)
@@ -82,17 +108,19 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, multiErr
 	}
 
-	// when there was no error, requeue after <interval> to keep changes in sync.
-	return ctrl.Result{RequeueAfter: syncInterval(syncObject)}, nil
+	// when there was no error, requeue after the resync interval as a
+	// drift-correction fallback -- reference changes are already synced
+	// immediately via the watch set up above.
+	return ctrl.Result{RequeueAfter: resyncInterval(syncObject)}, nil
 }
 
-// syncInterval returns the configured sync interval, falling back to
-// defaultInterval when none was set on the SyncObject.
-func syncInterval(syncObject syncv1alpha1.SyncObject) time.Duration {
-	if syncObject.Spec.Interval.Duration == 0 {
-		return defaultInterval
+// resyncInterval returns the configured resync interval, falling back to
+// defaultResyncInterval when none was set on the SyncObject.
+func resyncInterval(syncObject syncv1alpha1.SyncObject) time.Duration {
+	if syncObject.Spec.ResyncInterval.Duration == 0 {
+		return defaultResyncInterval
 	}
-	return syncObject.Spec.Interval.Duration
+	return syncObject.Spec.ResyncInterval.Duration
 }
 
 func (r *SyncObjectReconciler) handleFinalizer(ctx context.Context, syncObject *syncv1alpha1.SyncObject) (stop bool, err error) {
@@ -136,9 +164,95 @@ func (r *SyncObjectReconciler) handleFinalizer(ctx context.Context, syncObject *
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *SyncObjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &syncv1alpha1.SyncObject{}, referenceIndexKey, indexByReference); err != nil {
+		return fmt.Errorf("failed indexing SyncObject by reference: %w", err)
+	}
+
+	r.cache = mgr.GetCache()
+	r.watchedGVKs = make(map[schema.GroupVersionKind]struct{})
+
+	c, err := ctrl.NewControllerManagedBy(mgr).
 		For(&syncv1alpha1.SyncObject{}).
-		Complete(r)
+		Build(r)
+	if err != nil {
+		return err
+	}
+	r.dynamicController = c
+
+	return nil
+}
+
+// referenceIndexKey is the field index used to look up SyncObjects by the
+// object their Reference points at.
+const referenceIndexKey = "spec.reference"
+
+// referenceKey returns a stable key identifying the object a Reference
+// points at. It's used both to index SyncObjects by their Reference and to
+// look them back up from a watched object's own GVK/namespace/name.
+func referenceKey(group, version, kind, namespace, name string) string {
+	return strings.Join([]string{group, version, kind, namespace, name}, "/")
+}
+
+func indexByReference(obj client.Object) []string {
+	syncObject, ok := obj.(*syncv1alpha1.SyncObject)
+	if !ok {
+		return nil
+	}
+	ref := syncObject.Spec.Reference
+	return []string{referenceKey(ref.Group, ref.Version, ref.Kind, ref.Namespace, ref.Name)}
+}
+
+// ensureReferenceWatch makes sure changes to objects of ref's
+// GroupVersionKind trigger a reconcile, instead of only being picked up on
+// the next periodic resync. It's a no-op once a GVK has successfully been
+// watched once.
+func (r *SyncObjectReconciler) ensureReferenceWatch(ctx context.Context, ref syncv1alpha1.Reference) error {
+	gvk := schema.GroupVersionKind{Group: ref.Group, Version: ref.Version, Kind: ref.Kind}
+
+	r.watchedGVKsMu.Lock()
+	_, ok := r.watchedGVKs[gvk]
+	r.watchedGVKsMu.Unlock()
+	if ok {
+		return nil
+	}
+
+	watched := &unstructured.Unstructured{}
+	watched.SetGroupVersionKind(gvk)
+
+	mapFn := func(ctx context.Context, obj *unstructured.Unstructured) []reconcile.Request {
+		return r.requestsForReferenced(ctx, obj)
+	}
+
+	src := source.Kind(r.cache, watched, handler.TypedEnqueueRequestsFromMapFunc[*unstructured.Unstructured, reconcile.Request](mapFn))
+	if err := r.dynamicController.Watch(src); err != nil {
+		return fmt.Errorf("failed watching %s: %w", gvk, err)
+	}
+
+	r.watchedGVKsMu.Lock()
+	r.watchedGVKs[gvk] = struct{}{}
+	r.watchedGVKsMu.Unlock()
+
+	return nil
+}
+
+// requestsForReferenced finds the SyncObjects (if any) whose Reference
+// points at obj, so a change to the referenced object can trigger their
+// reconcile immediately instead of waiting for the periodic resync.
+func (r *SyncObjectReconciler) requestsForReferenced(ctx context.Context, obj *unstructured.Unstructured) []reconcile.Request {
+	gvk := obj.GroupVersionKind()
+	key := referenceKey(gvk.Group, gvk.Version, gvk.Kind, obj.GetNamespace(), obj.GetName())
+
+	var syncObjects syncv1alpha1.SyncObjectList
+	if err := r.Client.List(ctx, &syncObjects, client.MatchingFields{referenceIndexKey: key}); err != nil {
+		log.FromContext(ctx).Error(err, "failed listing SyncObjects for referenced object", "gvk", gvk, "namespace", obj.GetNamespace(), "name", obj.GetName())
+		return nil
+	}
+
+	requests := make([]reconcile.Request, 0, len(syncObjects.Items))
+	for _, syncObject := range syncObjects.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&syncObject)})
+	}
+	return requests
 }
 
 // TODO: add unit test

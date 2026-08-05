@@ -19,9 +19,14 @@ type SyncObjectSpec struct {
 	IgnoreNamespaces []string `json:"ignoreNamespaces,omitempty"`
 	// Don't add a finalizer which would clean up the replicas when this SyncObject gets deleted.
 	DisableFinalizer bool `json:"disableFinalizer,omitempty"`
-	// Interval for syncing the reference resource.
+	// ResyncInterval is how often the reference resource is re-checked and
+	// re-applied even without a detected change. Changes to the reference
+	// resource itself are synced immediately via a watch; this interval only
+	// matters as a drift-correction fallback (e.g. a replica was edited
+	// directly, a new target namespace appeared, or the watch could not yet
+	// be established).
 	// +kubebuilder:default="1h"
-	Interval metav1.Duration `json:"interval,omitempty"`
+	ResyncInterval metav1.Duration `json:"resyncInterval,omitempty"`
 }
 
 type Reference struct {

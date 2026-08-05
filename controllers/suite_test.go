@@ -263,13 +263,76 @@ func TestControllersIgnoreNamespaces(t *testing.T) {
 	})
 }
 
-// TestCRDDefaultsInterval creates a SyncObject as raw, unstructured JSON that
-// omits the "interval" field entirely, the way a hand-written YAML manifest
-// would. This is deliberately not done via the typed client: metav1.Duration
-// is a struct, and Go's encoding/json never treats "omitempty" struct fields
-// as empty, so the typed client always sends an explicit "interval":"0s" and
-// the CRD default would never get a chance to apply.
-func TestCRDDefaultsInterval(t *testing.T) {
+// TestControllersSyncsOnReferenceChange proves the dynamic reference watch
+// works: the SyncObject below is deliberately left at its default 1h
+// resync interval, so if the replica picks up a change to the *origin*
+// object within this test's short Eventually timeout, it can only be
+// because ensureReferenceWatch's watch fired -- not the periodic resync.
+func TestControllersSyncsOnReferenceChange(t *testing.T) {
+	ctx := context.Background()
+
+	originNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "watchtest-origin-namespace"},
+	}
+	targetNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "watchtest-target-namespace"},
+	}
+	originConfigMap := &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "watchtest-origin-configmap", Namespace: originNamespace.Name},
+		Data:       map[string]string{"key": "before"},
+	}
+
+	require.NoError(t, k8sClient.Create(ctx, originNamespace))
+	require.NoError(t, k8sClient.Create(ctx, targetNamespace))
+	require.NoError(t, k8sClient.Create(ctx, originConfigMap))
+
+	syncObject := &syncv1alpha1.SyncObject{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sync-watchtest"},
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "",
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Name:      originConfigMap.Name,
+				Namespace: originConfigMap.Namespace,
+			},
+			TargetNamespaces: []string{targetNamespace.Name},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, syncObject))
+
+	replicaKey := client.ObjectKey{Namespace: targetNamespace.Name, Name: originConfigMap.Name}
+	replica := &corev1.ConfigMap{}
+	require.Eventually(t, func() bool {
+		return k8sClient.Get(ctx, replicaKey, replica) == nil
+	}, timeout, interval)
+	require.Equal(t, map[string]string{"key": "before"}, replica.Data)
+
+	// update the ORIGIN object directly -- the SyncObject itself is never touched.
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(originConfigMap), originConfigMap))
+	originConfigMap.Data = map[string]string{"key": "after"}
+	require.NoError(t, k8sClient.Update(ctx, originConfigMap))
+
+	require.Eventually(t, func() bool {
+		if err := k8sClient.Get(ctx, replicaKey, replica); err != nil {
+			return false
+		}
+		return replica.Data["key"] == "after"
+	}, timeout, interval, "replica should pick up the origin change via the reference watch, well before the 1h default resync interval")
+}
+
+// TestCRDDefaultsResyncInterval creates a SyncObject as raw, unstructured
+// JSON that omits the "resyncInterval" field entirely, the way a
+// hand-written YAML manifest would. This is deliberately not done via the
+// typed client: metav1.Duration is a struct, and Go's encoding/json never
+// treats "omitempty" struct fields as empty, so the typed client always
+// sends an explicit "resyncInterval":"0s" and the CRD default would never
+// get a chance to apply.
+func TestCRDDefaultsResyncInterval(t *testing.T) {
 	ctx := context.Background()
 
 	u := &unstructured.Unstructured{
@@ -296,8 +359,8 @@ func TestCRDDefaultsInterval(t *testing.T) {
 	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(u), &syncObject))
 
 	// the generated CRD (deploy/crds/sync.sj14.github.io_syncobjects.yaml) and
-	// the controller's own fallback (syncInterval) must agree on the default.
-	require.Equal(t, defaultInterval, syncObject.Spec.Interval.Duration)
+	// the controller's own fallback (resyncInterval) must agree on the default.
+	require.Equal(t, defaultResyncInterval, syncObject.Spec.ResyncInterval.Duration)
 }
 
 // helper as gvk would be missing after creation
