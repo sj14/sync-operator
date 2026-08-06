@@ -21,11 +21,15 @@ Namespaces are watched as well, so a namespace created later gets its replicas s
 - Pin the image version of the operator in the [Deployment](deploy/deployment.yaml).
 - Adjust the [sample](deploy/samples/syncobject.yaml) according to the resource you want to sync.
 
-Apply the manifests:
+Apply the manifests, CRDs first:
 
 ```console
-kubectl apply -Rf deploy/
+kubectl apply -f deploy/crds/
+kubectl apply -f deploy/
+kubectl apply -f deploy/samples/
 ```
+
+Anything under [deploy/optional](deploy/optional) is deliberately left out and applied separately, see [below](#preventing-edits-to-replicas-optional).
 
 ## Example
 
@@ -99,5 +103,28 @@ kubectl get configmaps -A -l sync.sj14.github.io/managed-by=sync-operator
 ```
 
 These marks are also how the operator decides what it may delete. It only ever removes objects it created itself, matched by the marks above rather than by name, so an existing resource that happens to share a name with a replica is left alone.
+
+### Preventing edits to replicas (optional)
+
+Editing a replica appears to work and is then reverted from its source moments later, which is confusing to run into. An optional [ValidatingAdmissionPolicy](deploy/optional/protect-replicas.yaml) refuses the edit instead, and says where to make the change:
+
+```console
+kubectl apply -f deploy/optional/protect-replicas.yaml
+```
+
+It is not part of the install above, and needs Kubernetes 1.30 or newer.
+
+Two things to know before applying it:
+
+- It assumes the operator runs as `system:serviceaccount:sync-operator:sync-operator`. If you deployed it elsewhere, adjust `matchConditions` first, or the operator itself is denied and syncing stops.
+- It denies every update to a replica, for all kinds. Subresources are not affected, so a controller writing a replica's `status` or `scale` still works. A controller writing the *main* object does not — the `Deployment` controller setting its revision annotation, for example. If you sync such a kind, narrow `resourceRules` to exclude it.
+
+It covers updates only, not deletions. Denying deletions would leave any namespace holding a replica stuck in `Terminating`, and a deleted replica is restored from its source within moments anyway. It is a guardrail rather than a guarantee: a cluster admin can always remove the policy.
+
+Since it is applied separately, it is also removed separately — worth doing when uninstalling the operator, or the policy carries on refusing edits to whatever replicas are left behind:
+
+```console
+kubectl delete -f deploy/optional/protect-replicas.yaml
+```
 
 A replica cannot be used as the `reference` of another `SyncObject`. Both would end up managing objects of the same kind and name and overwrite each other's copies on every pass.

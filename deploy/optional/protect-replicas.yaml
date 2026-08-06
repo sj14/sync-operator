@@ -1,0 +1,85 @@
+# Optional: reject direct edits to the replicas sync-operator creates.
+#
+# Everything in deploy/optional/ is left out of the normal install, which
+# applies deploy/crds/, deploy/ and deploy/samples/ by name. Apply this one
+# yourself once you have read the two caveats below:
+#
+#     kubectl apply -f deploy/optional/protect-replicas.yaml
+#
+# Requires Kubernetes 1.30 or newer, where ValidatingAdmissionPolicy is GA.
+#
+# Without it, editing a replica appears to work and is then quietly reverted
+# by the operator, which is confusing. With it, the edit is refused outright
+# and says where to make the change instead.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: sync-operator-protect-replicas
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    # Only objects sync-operator created. The selector is evaluated against
+    # both the old and the new object, so stripping the label to get around
+    # the policy is itself an update that gets rejected.
+    objectSelector:
+      matchLabels:
+        sync.sj14.github.io/managed-by: sync-operator
+    resourceRules:
+      # Every kind, since that is the point of sync-operator. Narrow this to
+      # the kinds you actually sync if you prefer.
+      #
+      # "*" covers all resources but NOT their subresources, so a controller
+      # writing a replica's status or scale is unaffected -- those go to
+      # <resource>/status and <resource>/scale.
+      #
+      # What is affected is a controller writing the main object. If you sync
+      # such a kind, that controller starts getting denied: the Deployment
+      # controller setting the deployment.kubernetes.io/revision annotation,
+      # the PersistentVolume binder annotating a PVC, a cloud controller
+      # adding a finalizer to a LoadBalancer Service. Exclude those kinds here
+      # if you hit it.
+      - apiGroups: ["*"]
+        apiVersions: ["*"]
+        resources: ["*"]
+        # UPDATE only, deliberately.
+        #
+        # Denying DELETE would leave any namespace holding a replica stuck in
+        # Terminating: the namespace controller's cascading deletes go through
+        # admission too. It would also gain little, since a deleted replica is
+        # restored from its source within moments by the operator's watch.
+        operations: ["UPDATE"]
+        scope: Namespaced
+  matchConditions:
+    # The operator is the one principal still allowed to update replicas,
+    # otherwise it could not keep them in step with their source.
+    #
+    # A ServiceAccount's username is:
+    #
+    #     system:serviceaccount:<namespace>:<serviceaccount-name>
+    #                           ^ deploy/_namespace.yaml
+    #                                        ^ deploy/sa.yaml
+    #
+    # Both are "sync-operator" with the manifests in deploy/, which is why the
+    # value below repeats. Change whichever one you deployed differently --
+    # get it wrong and the operator itself is denied, so syncing stops.
+    - name: allow-sync-operator
+      expression: request.userInfo.username != "system:serviceaccount:sync-operator:sync-operator"
+  validations:
+    # Anything reaching this point is someone other than the operator editing
+    # a replica, which is always refused.
+    - expression: "false"
+      reason: Forbidden
+      message: >-
+        this object is a replica managed by sync-operator and must not be edited
+        directly; change the source object named by its
+        sync.sj14.github.io/source-namespace and sync.sj14.github.io/source-name
+        annotations instead, and the change will be replicated here
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: sync-operator-protect-replicas
+spec:
+  policyName: sync-operator-protect-replicas
+  validationActions: [Deny]

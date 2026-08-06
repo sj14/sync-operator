@@ -1,8 +1,11 @@
 package controllers
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -16,6 +19,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -1232,6 +1236,47 @@ func TestCRDRejectsInvalidSpecs(t *testing.T) {
 		require.NoError(t, k8sClient.Create(ctx, syncObject))
 		require.NoError(t, k8sClient.Delete(ctx, syncObject))
 	})
+}
+
+// TestProtectReplicasPolicyIsValid guards the optional admission policy
+// shipped in deploy/optional/. Nothing compiles that YAML, so a typo in a CEL
+// expression or a field name would only surface when a user applied it. The
+// API server compiles the expressions when the policy is created, which is
+// what this leans on.
+//
+// Only the policy is created, never its binding: a bound policy would start
+// rejecting the rest of the suite, which talks to envtest as the same user
+// the operator does and so cannot be told apart from it.
+func TestProtectReplicasPolicyIsValid(t *testing.T) {
+	ctx := context.Background()
+
+	raw, err := os.ReadFile(filepath.Join("..", "deploy", "optional", "protect-replicas.yaml"))
+	require.NoError(t, err)
+
+	decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(raw), 4096)
+
+	var policies []*unstructured.Unstructured
+	for {
+		object := &unstructured.Unstructured{}
+		err := decoder.Decode(object)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+
+		if len(object.Object) == 0 || object.GetKind() != "ValidatingAdmissionPolicy" {
+			continue
+		}
+		require.NoError(t, k8sClient.Create(ctx, object),
+			"the API server rejected the policy, so its CEL or its schema is wrong")
+		policies = append(policies, object)
+	}
+
+	require.NotEmpty(t, policies, "protect-replicas.yaml should contain a ValidatingAdmissionPolicy")
+
+	for _, policy := range policies {
+		require.NoError(t, k8sClient.Delete(ctx, policy))
+	}
 }
 
 // helper as gvk would be missing after creation

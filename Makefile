@@ -58,10 +58,15 @@ install: manifests  ## Install CRDs into the K8s cluster specified in ~/.kube/co
 uninstall: manifests ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config.
 	kubectl delete --ignore-not-found=true -Rf deploy/crds
 
+# Applied by name rather than with -R, so that deploy/optional/ stays opt-in.
 .PHONY: deploy
 deploy: manifests ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	kubectl apply -Rf deploy/
+	kubectl apply -f deploy/crds/
+	kubectl apply -f deploy/
+	kubectl apply -f deploy/samples/
 
 .PHONY: undeploy
 undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
-	kubectl delete --ignore-not-found=true -Rf deploy/
+	kubectl delete --ignore-not-found=true -f deploy/samples/
+	kubectl delete --ignore-not-found=true -f deploy/
+	kubectl delete --ignore-not-found=true -f deploy/crds/
