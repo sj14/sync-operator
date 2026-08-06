@@ -283,6 +283,93 @@ func TestControllersIgnoreNamespaces(t *testing.T) {
 	})
 }
 
+// TestControllersStripsOriginalStateFromReplicas covers copying an object
+// that is owned by something, or carries a finalizer. Both belong to the
+// original: a copied owner reference points at nothing in the replica's
+// namespace and gets the replica garbage collected, and a copied finalizer
+// is never removed by anyone, so the replica could never be deleted.
+func TestControllersStripsOriginalStateFromReplicas(t *testing.T) {
+	ctx := context.Background()
+
+	originNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "strip-origin-namespace"},
+	}
+	targetNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "strip-target-namespace"},
+	}
+
+	// something for the original to be owned by, in its own namespace
+	owner := &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "strip-owner", Namespace: originNamespace.Name},
+	}
+
+	require.NoError(t, k8sClient.Create(ctx, originNamespace))
+	require.NoError(t, k8sClient.Create(ctx, targetNamespace))
+	require.NoError(t, k8sClient.Create(ctx, owner))
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(owner), owner))
+
+	originConfigMap := &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "strip-configmap",
+			Namespace:  originNamespace.Name,
+			Finalizers: []string{"example.com/keep-around"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1",
+				Kind:       "ConfigMap",
+				Name:       owner.Name,
+				UID:        owner.UID,
+			}},
+			Annotations: map[string]string{
+				corev1.LastAppliedConfigAnnotation: `{"apiVersion":"v1","kind":"ConfigMap"}`,
+				"example.com/note":                 "keep me",
+			},
+		},
+		Data: map[string]string{"key": "value"},
+	}
+	require.NoError(t, k8sClient.Create(ctx, originConfigMap))
+
+	syncObject := &syncv1alpha1.SyncObject{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sync-strip"},
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "",
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Name:      originConfigMap.Name,
+				Namespace: originNamespace.Name,
+			},
+			TargetNamespaces: []string{targetNamespace.Name},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, syncObject))
+
+	replicaKey := client.ObjectKey{Namespace: targetNamespace.Name, Name: originConfigMap.Name}
+	replica := &corev1.ConfigMap{}
+	require.Eventually(t, func() bool {
+		return k8sClient.Get(ctx, replicaKey, replica) == nil
+	}, timeout, interval)
+
+	require.Empty(t, replica.OwnerReferences,
+		"a copied owner reference would get the replica garbage collected")
+	require.Empty(t, replica.Finalizers,
+		"a copied finalizer would make the replica impossible to delete")
+	require.NotContains(t, replica.Annotations, corev1.LastAppliedConfigAnnotation)
+
+	// the content and the original's own annotations still come across
+	require.Equal(t, map[string]string{"key": "value"}, replica.Data)
+	require.Equal(t, "keep me", replica.Annotations["example.com/note"])
+
+	// the original keeps everything it had
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(originConfigMap), originConfigMap))
+	require.NotEmpty(t, originConfigMap.OwnerReferences)
+	require.NotEmpty(t, originConfigMap.Finalizers)
+}
+
 // TestControllersMarksReplicas checks that replicas are identifiable as
 // such in the cluster, which is what a ValidatingAdmissionPolicy would need
 // to select them, and that the original is left alone.

@@ -197,6 +197,62 @@ func TestGetTargetNamespaces(t *testing.T) {
 	}
 }
 
+func TestStripOriginalState(t *testing.T) {
+	creationTimestamp := metav1.Now()
+
+	original := &unstructured.Unstructured{}
+	original.SetGroupVersionKind(testRef.GroupVersionKind())
+	original.SetName(testRef.Name)
+	original.SetNamespace(testRef.Namespace)
+	original.SetResourceVersion("12345")
+	original.SetUID("2b1c4d8e-0000-0000-0000-000000000000")
+	original.SetCreationTimestamp(creationTimestamp)
+	original.SetGeneration(7)
+	original.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: "cert-manager.io/v1",
+		Kind:       "Certificate",
+		Name:       "some-certificate",
+		UID:        "0f9d1a2b-0000-0000-0000-000000000000",
+	}})
+	original.SetFinalizers([]string{"example.com/some-finalizer"})
+	original.SetLabels(map[string]string{"team": "platform"})
+	original.SetAnnotations(map[string]string{
+		corev1.LastAppliedConfigAnnotation: `{"apiVersion":"v1","kind":"ConfigMap"}`,
+		"example.com/note":                 "keep me",
+	})
+	require.NoError(t, unstructured.SetNestedStringMap(original.Object, map[string]string{"key": "value"}, "data"))
+
+	replica := original.DeepCopy()
+	stripOriginalState(replica)
+
+	// An owner reference is only meaningful in the owner's own namespace, so
+	// a copied one makes the replica an orphan and gets it garbage collected.
+	require.Empty(t, replica.GetOwnerReferences(), "owner references must not be carried over")
+	// Nothing would ever remove a copied finalizer, leaving the replica
+	// undeletable.
+	require.Empty(t, replica.GetFinalizers(), "finalizers must not be carried over")
+
+	require.Empty(t, replica.GetResourceVersion())
+	require.Empty(t, replica.GetUID())
+	replicaCreationTimestamp := replica.GetCreationTimestamp()
+	require.True(t, replicaCreationTimestamp.IsZero())
+	require.Empty(t, replica.GetManagedFields())
+	require.NotContains(t, replica.GetAnnotations(), corev1.LastAppliedConfigAnnotation)
+
+	// the desired state is what a replica is for, so it has to survive
+	require.Equal(t, "keep me", replica.GetAnnotations()["example.com/note"])
+	require.Equal(t, "platform", replica.GetLabels()["team"])
+	data, found, err := unstructured.NestedStringMap(replica.Object, "data")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, map[string]string{"key": "value"}, data)
+
+	// and the original itself must not be touched
+	require.NotEmpty(t, original.GetOwnerReferences())
+	require.NotEmpty(t, original.GetFinalizers())
+	require.Equal(t, "12345", original.GetResourceVersion())
+}
+
 func TestMarkAsReplica(t *testing.T) {
 	syncObject := syncv1alpha1.SyncObject{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-syncobject"},

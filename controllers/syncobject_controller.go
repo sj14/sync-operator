@@ -13,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -64,6 +65,37 @@ const (
 	sourceNamespaceAnnotation = "sync.sj14.github.io/source-namespace"
 	sourceNameAnnotation      = "sync.sj14.github.io/source-name"
 )
+
+// stripOriginalState removes the parts of the copied object that describe the
+// original rather than the replica. What is left is the desired state: the
+// spec, data, labels and annotations the two are meant to share.
+func stripOriginalState(replica *unstructured.Unstructured) {
+	// identity of the original
+	replica.SetResourceVersion("")
+	replica.SetUID(types.UID(""))
+	replica.SetCreationTimestamp(metav1.Time{})
+	replica.SetManagedFields(nil)
+
+	// An owner reference to a namespaced owner only means anything within
+	// that owner's own namespace. Kubernetes treats a reference to an owner
+	// that isn't in the namespace as absent, and garbage collects the
+	// dependent once all its owners are absent. A copied owner reference
+	// therefore gets the replica deleted shortly after it is created -- and
+	// since we watch replicas, recreated, and deleted again.
+	replica.SetOwnerReferences(nil)
+
+	// Whatever would remove these finalizers is watching the original, not a
+	// copy of it in some other namespace, so on a replica they are never
+	// removed. The replica could then never be deleted, which would also
+	// block deleting the SyncObject and the namespace holding it.
+	replica.SetFinalizers(nil)
+
+	// Records an apply against the original. Leaving it on the replica would
+	// make a later `kubectl apply` there diff against the wrong base.
+	annotations := replica.GetAnnotations()
+	delete(annotations, corev1.LastAppliedConfigAnnotation)
+	replica.SetAnnotations(annotations)
+}
 
 // markAsReplica records that this object is a replica, and which SyncObject
 // and source object it came from. Existing labels and annotations copied
@@ -440,11 +472,7 @@ func (r *SyncObjectReconciler) replicate(ctx context.Context, syncObject syncv1a
 	replica := original.DeepCopy()
 	replica.SetNamespace(namespace)
 
-	// remove state from the old object
-	replica.SetResourceVersion("")
-	replica.SetUID(types.UID(""))
-	// TODO: add more?
-
+	stripOriginalState(replica)
 	markAsReplica(replica, syncObject)
 
 	log.Log.Info("creating/updating", "gvk", replica.GroupVersionKind().String(), "namespace", replica.GetNamespace(), "name", replica.GetName())
