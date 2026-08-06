@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 )
 
 func TestRemove(t *testing.T) {
@@ -435,6 +436,19 @@ func TestReplicateSkipsTerminatingNamespace(t *testing.T) {
 
 	require.NoError(t, r.replicate(context.Background(), testSyncObject, original, "doomed-ns"),
 		"a namespace being deleted is not a failure to report and retry")
+}
+
+func TestNamespaceCreatedPredicate(t *testing.T) {
+	// the initial list of an informer arrives as creations, so this also
+	// covers the namespaces that exist when the operator starts
+	require.True(t, namespaceCreated.Create(event.CreateEvent{}),
+		"a new namespace may need replicas")
+
+	require.False(t, namespaceCreated.Update(event.UpdateEvent{}),
+		"an update never makes a namespace newly eligible")
+	require.False(t, namespaceCreated.Delete(event.DeleteEvent{}),
+		"a deleted namespace takes its replicas with it")
+	require.False(t, namespaceCreated.Generic(event.GenericEvent{}))
 }
 
 func TestIsReplicaOf(t *testing.T) {

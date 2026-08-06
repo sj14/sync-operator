@@ -20,12 +20,15 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
@@ -290,7 +293,9 @@ func (r *SyncObjectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	c, err := ctrl.NewControllerManagedBy(mgr).
 		For(&syncv1alpha1.SyncObject{}).
 		// a namespace created later may need replicas of its own
-		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.requestsForNamespace)).
+		Watches(&corev1.Namespace{},
+			handler.EnqueueRequestsFromMapFunc(r.requestsForNamespace),
+			builder.WithPredicates(namespaceCreated)).
 		Build(r)
 	if err != nil {
 		return err
@@ -378,6 +383,22 @@ func (r *SyncObjectReconciler) requestsForObject(ctx context.Context, obj *unstr
 		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&syncObject)})
 	}
 	return requests
+}
+
+// namespaceCreated limits the namespace watch to namespaces appearing.
+//
+// A new namespace may need replicas. Nothing else about a namespace changes
+// what we would do with it: an update never makes one newly eligible, and
+// when one is deleted its replicas go with it. Namespaces are updated often
+// enough -- during termination, or by anything labelling them -- that
+// reacting to that would re-list every SyncObject for nothing.
+//
+// An informer delivers its initial list as creations, so the namespaces that
+// already exist are still covered when the operator starts.
+var namespaceCreated = predicate.Funcs{
+	UpdateFunc:  func(event.UpdateEvent) bool { return false },
+	DeleteFunc:  func(event.DeleteEvent) bool { return false },
+	GenericFunc: func(event.GenericEvent) bool { return false },
 }
 
 // requestsForNamespace enqueues the SyncObjects that would replicate into
