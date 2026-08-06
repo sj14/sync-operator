@@ -127,7 +127,7 @@ func updateWithRetry(ctx context.Context, t *testing.T, obj client.Object, mutat
 	}))
 }
 
-func TestControllersCreateDelete(t *testing.T) {
+func TestControllersCreatesReplica(t *testing.T) {
 	ctx := context.Background()
 
 	targetNamespace := &corev1.Namespace{
@@ -205,6 +205,138 @@ func TestControllersCreateDelete(t *testing.T) {
 		// check that the data was synced succesfully
 		require.Equal(t, configMapPayload, targetConfigMap.Data)
 	})
+}
+
+// TestControllersDeletingSyncObjectRemovesReplicas covers the finalizer,
+// which is the most destructive path in the operator: it deletes replicas
+// across every namespace. It also pins down that the finalizer actually
+// completes, since a finalizer that errors leaves the SyncObject stuck in
+// Terminating forever.
+func TestControllersDeletingSyncObjectRemovesReplicas(t *testing.T) {
+	ctx := context.Background()
+
+	originNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "delete-origin-namespace"},
+	}
+	firstTarget := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "delete-target-a"},
+	}
+	secondTarget := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "delete-target-b"},
+	}
+	originConfigMap := &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "delete-configmap", Namespace: originNamespace.Name},
+		Data:       map[string]string{"key": "value"},
+	}
+
+	require.NoError(t, k8sClient.Create(ctx, originNamespace))
+	require.NoError(t, k8sClient.Create(ctx, firstTarget))
+	require.NoError(t, k8sClient.Create(ctx, secondTarget))
+	require.NoError(t, k8sClient.Create(ctx, originConfigMap))
+
+	syncObject := &syncv1alpha1.SyncObject{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sync-delete"},
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "",
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Name:      originConfigMap.Name,
+				Namespace: originNamespace.Name,
+			},
+			TargetNamespaces: []string{firstTarget.Name, secondTarget.Name},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, syncObject))
+
+	replicaKeys := []client.ObjectKey{
+		{Namespace: firstTarget.Name, Name: originConfigMap.Name},
+		{Namespace: secondTarget.Name, Name: originConfigMap.Name},
+	}
+	for _, key := range replicaKeys {
+		require.Eventually(t, func() bool {
+			return k8sClient.Get(ctx, key, &corev1.ConfigMap{}) == nil
+		}, timeout, interval, "the replica should have been created first")
+	}
+
+	require.NoError(t, k8sClient.Delete(ctx, syncObject))
+
+	require.Eventually(t, func() bool {
+		return apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(syncObject), &syncv1alpha1.SyncObject{}))
+	}, timeout, interval, "the SyncObject should be gone, i.e. the finalizer completed")
+
+	for _, key := range replicaKeys {
+		require.Eventually(t, func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(ctx, key, &corev1.ConfigMap{}))
+		}, timeout, interval, "the replicas should have been cleaned up with the SyncObject")
+	}
+
+	// the original is not a replica and stays put
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(originConfigMap), &corev1.ConfigMap{}),
+		"deleting the SyncObject must not delete the resource it was replicating")
+}
+
+// TestControllersDisableFinalizerKeepsReplicas covers the documented
+// opt out: with disableFinalizer the replicas are deliberately left behind
+// when the SyncObject goes away.
+func TestControllersDisableFinalizerKeepsReplicas(t *testing.T) {
+	ctx := context.Background()
+
+	originNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "nofinalizer-origin-namespace"},
+	}
+	targetNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "nofinalizer-target-namespace"},
+	}
+	originConfigMap := &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "nofinalizer-configmap", Namespace: originNamespace.Name},
+		Data:       map[string]string{"key": "value"},
+	}
+
+	require.NoError(t, k8sClient.Create(ctx, originNamespace))
+	require.NoError(t, k8sClient.Create(ctx, targetNamespace))
+	require.NoError(t, k8sClient.Create(ctx, originConfigMap))
+
+	syncObject := &syncv1alpha1.SyncObject{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sync-nofinalizer"},
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "",
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Name:      originConfigMap.Name,
+				Namespace: originNamespace.Name,
+			},
+			TargetNamespaces: []string{targetNamespace.Name},
+			DisableFinalizer: true,
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, syncObject))
+
+	replicaKey := client.ObjectKey{Namespace: targetNamespace.Name, Name: originConfigMap.Name}
+	require.Eventually(t, func() bool {
+		return k8sClient.Get(ctx, replicaKey, &corev1.ConfigMap{}) == nil
+	}, timeout, interval)
+
+	require.NoError(t, k8sClient.Delete(ctx, syncObject))
+
+	require.Eventually(t, func() bool {
+		return apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(syncObject), &syncv1alpha1.SyncObject{}))
+	}, timeout, interval, "the SyncObject should still be deletable")
+
+	// nothing is going to remove the replica now, which is the point
+	require.Never(t, func() bool {
+		return apierrors.IsNotFound(k8sClient.Get(ctx, replicaKey, &corev1.ConfigMap{}))
+	}, 2*time.Second, interval, "with disableFinalizer the replica should be left behind")
 }
 
 func TestControllersIgnoreNamespaces(t *testing.T) {
