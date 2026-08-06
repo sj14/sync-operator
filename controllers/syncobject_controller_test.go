@@ -9,6 +9,7 @@ import (
 	syncv1alpha1 "github.com/sj14/sync-operator/api/v1alpha1"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -310,6 +311,74 @@ func markedConfigMap(namespace, syncObjectName string, ref syncv1alpha1.Referenc
 			},
 		},
 	}
+}
+
+// TestGetTargetNamespacesSkipsTerminating covers a namespace on its way
+// out: nothing can be created in it, so replicating into it only produces
+// failures until it finally disappears.
+func TestGetTargetNamespacesSkipsTerminating(t *testing.T) {
+	deletionTimestamp := metav1.Now()
+
+	fakeClient := fake.NewClientBuilder().
+		WithObjects(
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "alive-ns"}},
+			&corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{Name: "phase-terminating-ns"},
+				Status:     corev1.NamespaceStatus{Phase: corev1.NamespaceTerminating},
+			},
+			&corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "being-deleted-ns",
+					DeletionTimestamp: &deletionTimestamp,
+					Finalizers:        []string{"kubernetes.io/test"},
+				},
+			},
+		).
+		Build()
+
+	r := &SyncObjectReconciler{Client: fakeClient}
+
+	syncObject := syncv1alpha1.SyncObject{
+		Spec: syncv1alpha1.SyncObjectSpec{Reference: testRef},
+	}
+
+	targets, err := r.getTargetNamespaces(context.Background(), syncObject)
+	require.NoError(t, err)
+
+	require.Equal(t, []string{"alive-ns"}, targets)
+}
+
+// TestReplicateSkipsTerminatingNamespace closes the gap the filtering above
+// cannot: an explicitly listed namespace is never checked, and any namespace
+// can start terminating between the check and the create.
+func TestReplicateSkipsTerminatingNamespace(t *testing.T) {
+	terminating := apierrors.NewForbidden(
+		schema.GroupResource{Resource: "configmaps"}, testRef.Name,
+		errors.New("unable to create new content in namespace doomed-ns because it is being terminated"),
+	)
+	terminating.ErrStatus.Details.Causes = append(terminating.ErrStatus.Details.Causes, metav1.StatusCause{
+		Type:    corev1.NamespaceTerminatingCause,
+		Message: "namespace doomed-ns is being terminated",
+		Field:   "metadata.namespace",
+	})
+
+	fakeClient := fake.NewClientBuilder().
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				return terminating
+			},
+		}).
+		Build()
+
+	r := &SyncObjectReconciler{Client: fakeClient}
+
+	original := &unstructured.Unstructured{}
+	original.SetGroupVersionKind(testRef.GroupVersionKind())
+	original.SetName(testRef.Name)
+	original.SetNamespace(testRef.Namespace)
+
+	require.NoError(t, r.replicate(context.Background(), testSyncObject, original, "doomed-ns"),
+		"a namespace being deleted is not a failure to report and retry")
 }
 
 func TestIsReplicaOf(t *testing.T) {

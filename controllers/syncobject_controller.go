@@ -381,6 +381,9 @@ func (r *SyncObjectReconciler) getTargetNamespaces(ctx context.Context, syncObje
 			return nil, fmt.Errorf("failed listing namespaces: %v", err)
 		}
 		for _, namespace := range allNamespaces.Items {
+			if isTerminating(namespace) {
+				continue
+			}
 			targetNamespaces = append(targetNamespaces, namespace.GetName())
 		}
 	}
@@ -391,6 +394,13 @@ func (r *SyncObjectReconciler) getTargetNamespaces(ctx context.Context, syncObje
 	}
 
 	return remove(targetNamespaces, syncObject.Spec.Reference.Namespace), nil
+}
+
+// isTerminating reports whether the namespace is on its way out. The API
+// server refuses to create anything in one, so it is pointless as a
+// replication target.
+func isTerminating(namespace corev1.Namespace) bool {
+	return namespace.Status.Phase == corev1.NamespaceTerminating || !namespace.DeletionTimestamp.IsZero()
 }
 
 // remove returns a copy of slice with all elements equal to s removed.
@@ -441,6 +451,17 @@ func (r *SyncObjectReconciler) replicate(ctx context.Context, syncObject syncv1a
 
 	// create new replica if it doesn't already exist
 	err := r.Client.Create(ctx, replica)
+	if err != nil && apierrors.HasStatusCause(err, corev1.NamespaceTerminatingCause) {
+		// The namespace is being deleted, so nothing can be created in it and
+		// whatever is in there is about to go away regardless. Retrying until
+		// the namespace finally disappears would only produce noise.
+		//
+		// getTargetNamespaces already skips namespaces it saw terminating;
+		// this covers the ones that started while we were working, and the
+		// ones a user listed in targetNamespaces explicitly.
+		log.Log.Info("skipping terminating namespace", "namespace", namespace)
+		return nil
+	}
 	if err != nil && !apierrors.IsAlreadyExists(err) {
 		// some other error than already exists...
 		return fmt.Errorf("failed creating replica in %q: %v", namespace, err)
