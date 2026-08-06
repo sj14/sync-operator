@@ -67,18 +67,25 @@ spec:
                 description: Explicitly skip replication to the specified namespaces.
                 items:
                   type: string
+                maxItems: 1000
                 type: array
               reference:
                 properties:
                   group:
+                    description: Group of the referenced resource, empty for the core
+                      group.
                     type: string
                   kind:
+                    minLength: 1
                     type: string
                   name:
+                    minLength: 1
                     type: string
                   namespace:
+                    minLength: 1
                     type: string
                   version:
+                    minLength: 1
                     type: string
                 required:
                 - group
@@ -96,16 +103,28 @@ spec:
                   matters as a drift-correction fallback (e.g. a replica was edited
                   directly, a new target namespace appeared, or the watch could not yet
                   be established).
+
+                  Zero means the default. A negative value would silently disable the
+                  resync altogether, and anything under a second would hammer the API
+                  server, so both are rejected.
                 type: string
+                x-kubernetes-validations:
+                - message: resyncInterval must be at least 1s, or 0 to use the default
+                  rule: duration(self) == duration('0s') || duration(self) >= duration('1s')
               targetNamespaces:
                 description: If no target namespaces are defined, all namespaces will
                   be used.
                 items:
                   type: string
+                maxItems: 1000
                 type: array
             required:
             - reference
             type: object
+            x-kubernetes-validations:
+            - message: a namespace cannot be in both targetNamespaces and ignoreNamespaces
+              rule: '!has(self.targetNamespaces) || !has(self.ignoreNamespaces) ||
+                !self.targetNamespaces.exists(n, n in self.ignoreNamespaces)'
           status:
             description: SyncObjectStatus defines the observed state of SyncObject
             properties:
@@ -117,14 +136,20 @@ spec:
                   be orphaned.
                 properties:
                   group:
+                    description: Group of the referenced resource, empty for the core
+                      group.
                     type: string
                   kind:
+                    minLength: 1
                     type: string
                   name:
+                    minLength: 1
                     type: string
                   namespace:
+                    minLength: 1
                     type: string
                   version:
+                    minLength: 1
                     type: string
                 required:
                 - group

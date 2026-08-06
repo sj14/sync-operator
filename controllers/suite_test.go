@@ -482,7 +482,9 @@ func TestControllersIgnoreNamespaces(t *testing.T) {
 				Name:      originConfigMap.Name,
 				Namespace: originConfigMap.Namespace,
 			},
-			TargetNamespaces: []string{targetNamespaceA.Name, targetNamespaceB.Name, ignoredNamespace.Name},
+			// no targetNamespaces: every namespace is a target except the
+			// ignored one, which is what ignoreNamespaces is actually for.
+			// Listing a namespace in both is contradictory and now rejected.
 			IgnoreNamespaces: []string{ignoredNamespace.Name},
 		},
 	}
@@ -1131,6 +1133,105 @@ func TestCRDDefaultsResyncInterval(t *testing.T) {
 	// the generated CRD (deploy/crds/sync.sj14.github.io_syncobjects.yaml) and
 	// the controller's own fallback (resyncInterval) must agree on the default.
 	require.Equal(t, defaultResyncInterval, syncObject.Spec.ResyncInterval.Duration)
+}
+
+// TestCRDRejectsInvalidSpecs covers the schema validation, which turns
+// configurations that used to fail quietly at reconcile time -- or not at
+// all -- into an immediate rejection.
+func TestCRDRejectsInvalidSpecs(t *testing.T) {
+	ctx := context.Background()
+
+	validSpec := func() syncv1alpha1.SyncObjectSpec {
+		return syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "",
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Name:      "some-configmap",
+				Namespace: "default",
+			},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		mutate      func(*syncv1alpha1.SyncObjectSpec)
+		wantMessage string
+	}{
+		{
+			// this used to disable the resync entirely and silently:
+			// controller-runtime only requeues when RequeueAfter is positive
+			name:        "negative-resync-interval",
+			mutate:      func(s *syncv1alpha1.SyncObjectSpec) { s.ResyncInterval = metav1.Duration{Duration: -5 * time.Minute} },
+			wantMessage: "resyncInterval must be at least 1s",
+		},
+		{
+			name:        "sub-second-resync-interval",
+			mutate:      func(s *syncv1alpha1.SyncObjectSpec) { s.ResyncInterval = metav1.Duration{Duration: time.Millisecond} },
+			wantMessage: "resyncInterval must be at least 1s",
+		},
+		{
+			// an empty kind used to just skip setting up the watch
+			name:        "empty-kind",
+			mutate:      func(s *syncv1alpha1.SyncObjectSpec) { s.Reference.Kind = "" },
+			wantMessage: "spec.reference.kind",
+		},
+		{
+			name:        "empty-version",
+			mutate:      func(s *syncv1alpha1.SyncObjectSpec) { s.Reference.Version = "" },
+			wantMessage: "spec.reference.version",
+		},
+		{
+			name:        "empty-reference-name",
+			mutate:      func(s *syncv1alpha1.SyncObjectSpec) { s.Reference.Name = "" },
+			wantMessage: "spec.reference.name",
+		},
+		{
+			name: "namespace-in-both-lists",
+			mutate: func(s *syncv1alpha1.SyncObjectSpec) {
+				s.TargetNamespaces = []string{"somewhere", "contradictory"}
+				s.IgnoreNamespaces = []string{"contradictory"}
+			},
+			wantMessage: "cannot be in both targetNamespaces and ignoreNamespaces",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := validSpec()
+			tt.mutate(&spec)
+
+			syncObject := &syncv1alpha1.SyncObject{
+				TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+				ObjectMeta: metav1.ObjectMeta{Name: "invalid-" + tt.name},
+				Spec:       spec,
+			}
+
+			err := k8sClient.Create(ctx, syncObject)
+			if err == nil {
+				// don't leave it behind to confuse the other tests
+				require.NoError(t, k8sClient.Delete(ctx, syncObject))
+				t.Fatal("expected the API server to reject this spec")
+			}
+			require.ErrorContains(t, err, tt.wantMessage)
+		})
+	}
+
+	// the rules must not be so broad that a sensible spec is refused
+	t.Run("a valid spec is accepted", func(t *testing.T) {
+		spec := validSpec()
+		spec.ResyncInterval = metav1.Duration{Duration: 30 * time.Second}
+		spec.TargetNamespaces = []string{"somewhere"}
+		spec.IgnoreNamespaces = []string{"somewhere-else"}
+
+		syncObject := &syncv1alpha1.SyncObject{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+			ObjectMeta: metav1.ObjectMeta{Name: "valid-spec"},
+			Spec:       spec,
+		}
+		require.NoError(t, k8sClient.Create(ctx, syncObject))
+		require.NoError(t, k8sClient.Delete(ctx, syncObject))
+	})
 }
 
 // helper as gvk would be missing after creation

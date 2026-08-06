@@ -9,14 +9,17 @@ import (
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
 // SyncObjectSpec defines the desired state of SyncObject
+// +kubebuilder:validation:XValidation:rule="!has(self.targetNamespaces) || !has(self.ignoreNamespaces) || !self.targetNamespaces.exists(n, n in self.ignoreNamespaces)",message="a namespace cannot be in both targetNamespaces and ignoreNamespaces"
 type SyncObjectSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 
 	Reference Reference `json:"reference"`
 	// If no target namespaces are defined, all namespaces will be used.
+	// +kubebuilder:validation:MaxItems=1000
 	TargetNamespaces []string `json:"targetNamespaces,omitempty"`
 	// Explicitly skip replication to the specified namespaces.
+	// +kubebuilder:validation:MaxItems=1000
 	IgnoreNamespaces []string `json:"ignoreNamespaces,omitempty"`
 	// Don't add a finalizer which would clean up the replicas when this SyncObject gets deleted.
 	DisableFinalizer bool `json:"disableFinalizer,omitempty"`
@@ -26,15 +29,25 @@ type SyncObjectSpec struct {
 	// matters as a drift-correction fallback (e.g. a replica was edited
 	// directly, a new target namespace appeared, or the watch could not yet
 	// be established).
+	//
+	// Zero means the default. A negative value would silently disable the
+	// resync altogether, and anything under a second would hammer the API
+	// server, so both are rejected.
 	// +kubebuilder:default="1h"
+	// +kubebuilder:validation:XValidation:rule="duration(self) == duration('0s') || duration(self) >= duration('1s')",message="resyncInterval must be at least 1s, or 0 to use the default"
 	ResyncInterval metav1.Duration `json:"resyncInterval,omitempty"`
 }
 
 type Reference struct {
-	Group     string `json:"group"`
-	Version   string `json:"version"`
-	Kind      string `json:"kind"`
-	Name      string `json:"name"`
+	// Group of the referenced resource, empty for the core group.
+	Group string `json:"group"`
+	// +kubebuilder:validation:MinLength=1
+	Version string `json:"version"`
+	// +kubebuilder:validation:MinLength=1
+	Kind string `json:"kind"`
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+	// +kubebuilder:validation:MinLength=1
 	Namespace string `json:"namespace"`
 }
 

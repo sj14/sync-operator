@@ -49,10 +49,10 @@ kind: SyncObject
 metadata:
   name: syncobject-sample
 spec:
-  # resyncInterval: 1h      # Safety-net interval on top of the real-time watches (defaults to 1h)
+  # resyncInterval: 1h      # Safety-net interval on top of the real-time watches (defaults to 1h, minimum 1s)
   # targetNamespaces:       # Namespaces to replicate the reference into (defaults to all namespaces)
   #   - kube-public
-  # ignoreNamespaces:       # Namespaces to not replicate into
+  # ignoreNamespaces:       # Namespaces to not replicate into (cannot overlap targetNamespaces)
   #   - kube-system
   # disableFinalizer: true  # Do not remove replicas when the reference gets removed
   reference:                # Reference which will get replicated into other namespaces
