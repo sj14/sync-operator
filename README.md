@@ -65,6 +65,22 @@ spec:
 
 After applying the manifests, the `ConfigMap` should get synced across the namespaces.
 
+## Status
+
+Each `SyncObject` reports whether its last sync worked, so a broken one can be spotted without reading the operator's logs:
+
+```console
+kubectl get syncobjects
+```
+
+```
+NAME                KIND        SOURCE      READY   REASON       AGE
+syncobject-sample   ConfigMap   test-sync   True    Synced       5m
+broken-sample       Secret      missing     False   SyncFailed   2m
+```
+
+`kubectl describe syncobject broken-sample` then shows the `Ready` condition with the reason it failed. `status.observedGeneration` tells you whether the most recent change to the spec has been acted on yet.
+
 ## Replicas
 
 Replicas keep the labels and annotations of the resource they were copied from, and get these added on top:

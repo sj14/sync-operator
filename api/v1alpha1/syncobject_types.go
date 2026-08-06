@@ -54,11 +54,34 @@ type SyncObjectStatus struct {
 	// be orphaned.
 	// +optional
 	AppliedReference *Reference `json:"appliedReference,omitempty"`
+
+	// ObservedGeneration is the metadata.generation this status was last
+	// reconciled from. When it trails metadata.generation, the most recent
+	// change to the spec has not been acted on yet.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// Conditions holds the Ready condition, which reports whether the last
+	// sync succeeded and, when it didn't, why.
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
+
+// ConditionReady is set on a SyncObject to report whether its last sync
+// succeeded.
+const ConditionReady = "Ready"
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
 //+kubebuilder:resource:scope=Cluster
+//+kubebuilder:printcolumn:name="Kind",type=string,JSONPath=`.spec.reference.kind`
+//+kubebuilder:printcolumn:name="Source",type=string,JSONPath=`.spec.reference.name`
+//+kubebuilder:printcolumn:name="Source-Namespace",type=string,JSONPath=`.spec.reference.namespace`,priority=1
+//+kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+//+kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].reason`
+//+kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // SyncObject is the Schema for the syncobjects API
 type SyncObject struct {

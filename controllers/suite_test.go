@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -204,6 +205,100 @@ func TestControllersCreatesReplica(t *testing.T) {
 
 		// check that the data was synced succesfully
 		require.Equal(t, configMapPayload, targetConfigMap.Data)
+	})
+}
+
+// TestControllersReportsStatus covers what a user sees with kubectl: a
+// SyncObject that works says so, and one that doesn't explains why in the
+// object rather than only in the operator's logs.
+func TestControllersReportsStatus(t *testing.T) {
+	ctx := context.Background()
+
+	originNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "status-origin-namespace"},
+	}
+	targetNamespace := &corev1.Namespace{
+		TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "status-target-namespace"},
+	}
+	originConfigMap := &corev1.ConfigMap{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{Name: "status-configmap", Namespace: originNamespace.Name},
+		Data:       map[string]string{"key": "value"},
+	}
+
+	require.NoError(t, k8sClient.Create(ctx, originNamespace))
+	require.NoError(t, k8sClient.Create(ctx, targetNamespace))
+	require.NoError(t, k8sClient.Create(ctx, originConfigMap))
+
+	syncObject := &syncv1alpha1.SyncObject{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "sync.sj14.github.io/v1alpha1", Kind: "SyncObject"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sync-status"},
+		Spec: syncv1alpha1.SyncObjectSpec{
+			Reference: syncv1alpha1.Reference{
+				Group:     "",
+				Version:   "v1",
+				Kind:      "ConfigMap",
+				Name:      originConfigMap.Name,
+				Namespace: originNamespace.Name,
+			},
+			TargetNamespaces: []string{targetNamespace.Name},
+		},
+	}
+	require.NoError(t, k8sClient.Create(ctx, syncObject))
+
+	readyCondition := func() *metav1.Condition {
+		fetched := &syncv1alpha1.SyncObject{}
+		if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(syncObject), fetched); err != nil {
+			return nil
+		}
+		return apimeta.FindStatusCondition(fetched.Status.Conditions, syncv1alpha1.ConditionReady)
+	}
+
+	t.Run("a working SyncObject reports Ready", func(t *testing.T) {
+		require.Eventually(t, func() bool {
+			condition := readyCondition()
+			return condition != nil && condition.Status == metav1.ConditionTrue
+		}, timeout, interval)
+
+		require.Equal(t, "Synced", readyCondition().Reason)
+
+		fetched := &syncv1alpha1.SyncObject{}
+		require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(syncObject), fetched))
+		require.Equal(t, fetched.Generation, fetched.Status.ObservedGeneration)
+	})
+
+	// The status is written by the operator, so writing it wakes its own
+	// watch. Writing unconditionally would reconcile forever.
+	t.Run("a settled SyncObject stops being written to", func(t *testing.T) {
+		fetched := &syncv1alpha1.SyncObject{}
+		require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(syncObject), fetched))
+		settled := fetched.ResourceVersion
+
+		require.Never(t, func() bool {
+			current := &syncv1alpha1.SyncObject{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(syncObject), current); err != nil {
+				return false
+			}
+			return current.ResourceVersion != settled
+		}, 3*time.Second, interval, "the SyncObject keeps being rewritten, the operator is reacting to its own status updates")
+	})
+
+	t.Run("a broken reference is reported on the object", func(t *testing.T) {
+		updateWithRetry(ctx, t, syncObject, func() {
+			syncObject.Spec.Reference.Name = "no-such-configmap"
+		})
+
+		require.Eventually(t, func() bool {
+			condition := readyCondition()
+			return condition != nil && condition.Status == metav1.ConditionFalse
+		}, timeout, interval)
+
+		condition := readyCondition()
+		require.Equal(t, "SyncFailed", condition.Reason)
+		require.Contains(t, condition.Message, "no-such-configmap",
+			"the message should say what actually went wrong")
 	})
 }
 

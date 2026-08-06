@@ -11,6 +11,7 @@ import (
 
 	syncv1alpha1 "github.com/sj14/sync-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -163,19 +164,40 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, nil
 	}
 
+	syncErr := r.sync(ctx, syncObject)
+
+	// Recorded whatever happened, so a failure is visible in the object
+	// rather than only in the operator's logs.
+	if err := r.updateStatus(ctx, &syncObject, syncErr); err != nil {
+		return ctrl.Result{}, errors.Join(syncErr, err)
+	}
+	if syncErr != nil {
+		return ctrl.Result{}, syncErr
+	}
+
+	// when there was no error, requeue after the resync interval as a
+	// drift-correction fallback -- reference changes are already synced
+	// immediately via the watch set up above.
+	return ctrl.Result{RequeueAfter: resyncInterval(syncObject)}, nil
+}
+
+// sync brings the replicas in line with the reference.
+func (r *SyncObjectReconciler) sync(ctx context.Context, syncObject syncv1alpha1.SyncObject) error {
+	logger := log.FromContext(ctx)
+
 	// spec.reference was changed to point somewhere else: the replicas of the
 	// previous reference are named after it, so nothing below would ever touch
 	// them again and they'd be orphaned.
 	if applied := syncObject.Status.AppliedReference; applied != nil && *applied != syncObject.Spec.Reference {
 		logger.Info("reference changed, removing replicas of the previous reference", "previous", *applied, "current", syncObject.Spec.Reference)
 		if err := r.deleteReplicas(ctx, syncObject, *applied, nil); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed removing replicas of the previous reference: %v", err)
+			return fmt.Errorf("failed removing replicas of the previous reference: %v", err)
 		}
 	}
 
 	targetNamespaces, err := r.getTargetNamespaces(ctx, syncObject)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed getting target namespaces: %v", err)
+		return fmt.Errorf("failed getting target namespaces: %v", err)
 	}
 
 	var multiErr error
@@ -197,21 +219,7 @@ func (r *SyncObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
-	if multiErr != nil {
-		return ctrl.Result{}, multiErr
-	}
-
-	// Only recorded once the replicas above actually exist. If replication
-	// failed we keep the previous value, so the next attempt still knows
-	// which replicas to clean up.
-	if err := r.setAppliedReference(ctx, &syncObject); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// when there was no error, requeue after the resync interval as a
-	// drift-correction fallback -- reference changes are already synced
-	// immediately via the watch set up above.
-	return ctrl.Result{RequeueAfter: resyncInterval(syncObject)}, nil
+	return multiErr
 }
 
 // resyncInterval returns the configured resync interval, falling back to
@@ -580,18 +588,55 @@ func referencesToCleanUp(syncObject syncv1alpha1.SyncObject) []syncv1alpha1.Refe
 	return refs
 }
 
-// setAppliedReference records the reference we just replicated, so a later
-// change to spec.reference can find and clean up these replicas.
-func (r *SyncObjectReconciler) setAppliedReference(ctx context.Context, syncObject *syncv1alpha1.SyncObject) error {
-	if applied := syncObject.Status.AppliedReference; applied != nil && *applied == syncObject.Spec.Reference {
+// maxConditionMessage keeps the message inside the 32768 characters the API
+// allows. An error joined across a few hundred namespaces can get long.
+const maxConditionMessage = 2048
+
+// updateStatus records the outcome of a sync on the SyncObject itself, so a
+// failure is visible to whoever created it rather than only in the
+// operator's logs.
+//
+// It writes nothing when the status is unchanged. A write here would
+// otherwise wake the SyncObject watch and reconcile again, forever.
+func (r *SyncObjectReconciler) updateStatus(ctx context.Context, syncObject *syncv1alpha1.SyncObject, syncErr error) error {
+	previous := syncObject.Status.DeepCopy()
+
+	condition := metav1.Condition{
+		Type:               syncv1alpha1.ConditionReady,
+		Status:             metav1.ConditionTrue,
+		Reason:             "Synced",
+		Message:            "The reference is replicated to its target namespaces",
+		ObservedGeneration: syncObject.Generation,
+	}
+	if syncErr != nil {
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = "SyncFailed"
+		condition.Message = truncate(syncErr.Error(), maxConditionMessage)
+	} else {
+		// Only recorded once the replicas actually exist. If replication
+		// failed we keep the previous value, so the next attempt still knows
+		// which replicas to clean up.
+		ref := syncObject.Spec.Reference
+		syncObject.Status.AppliedReference = &ref
+	}
+
+	meta.SetStatusCondition(&syncObject.Status.Conditions, condition)
+	syncObject.Status.ObservedGeneration = syncObject.Generation
+
+	if equality.Semantic.DeepEqual(previous, &syncObject.Status) {
 		return nil
 	}
 
-	ref := syncObject.Spec.Reference
-	syncObject.Status.AppliedReference = &ref
 	if err := r.Status().Update(ctx, syncObject); err != nil {
-		return fmt.Errorf("failed recording applied reference: %v", err)
+		return fmt.Errorf("failed updating status: %v", err)
 	}
 
 	return nil
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
 }
