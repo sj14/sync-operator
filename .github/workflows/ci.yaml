@@ -5,7 +5,7 @@ on:
       - go.mod
       - go.sum
       - "**.go"
-      - ".github/workflows/ci.yaml"
+      - ".github/workflows/**"
       - Makefile
       - deploy/crds/**
 jobs:
